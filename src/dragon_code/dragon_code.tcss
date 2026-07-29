@@ -1,0 +1,107 @@
+Screen {
+    layout: vertical;
+    background: $surface;
+    color: $text;
+}
+
+#banner {
+    width: 1fr;
+    height: auto;
+    padding: 1 2 0 2;
+    color: $accent;
+}
+
+#ready {
+    width: 1fr;
+    height: 1;
+    margin: 0 2;
+    color: $text-muted;
+}
+
+#conversation {
+    width: 1fr;
+    height: 1fr;
+    margin: 1 2 0 2;
+    scrollbar-size: 1 1;
+}
+
+#streaming {
+    width: 1fr;
+    height: auto;
+    max-height: 40%;
+    margin: 0 2;
+    color: $text;
+}
+
+#timer {
+    width: 1fr;
+    height: 1;
+    margin: 0 2;
+    color: $warning;
+}
+
+#input-row {
+    width: 1fr;
+    height: 5;
+    margin: 0 2;
+    border: round $accent;
+}
+
+#input-prompt {
+    width: 3;
+    height: 1fr;
+    padding: 1 0 0 1;
+    color: $accent;
+    text-style: bold;
+}
+
+#message-input {
+    width: 1fr;
+    height: 1fr;
+    border: none;
+    background: transparent;
+}
+
+#statusbar {
+    width: 1fr;
+    height: 1;
+    padding: 0 2;
+    background: $primary-background;
+    color: $text-muted;
+}
+
+#provider-name {
+    width: 1fr;
+}
+
+#model-name {
+    width: auto;
+    text-align: right;
+}
+
+ProviderSelectScreen {
+    align: center middle;
+    background: $background 70%;
+}
+
+#provider-dialog {
+    width: 70%;
+    max-width: 80;
+    height: auto;
+    max-height: 70%;
+    border: round $accent;
+    background: $surface;
+    padding: 1 2;
+}
+
+#provider-title {
+    width: 1fr;
+    height: 2;
+    text-style: bold;
+}
+
+#provider-options {
+    width: 1fr;
+    height: auto;
+    max-height: 20;
+}

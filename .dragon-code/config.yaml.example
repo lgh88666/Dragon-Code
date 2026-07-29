@@ -1,0 +1,15 @@
+providers:
+  - name: "Anthropic"
+    protocol: "anthropic"
+    api_key: "请填写你的 Anthropic API Key"
+    model: "claude-sonnet-4-5"
+    thinking: true
+
+  - name: "OpenAI Compatible"
+    protocol: "openai"
+    api_key: "请填写你的 OpenAI API Key"
+    model: "gpt-5"
+    # 接入兼容服务时填写；使用 OpenAI 官方端点时可删除本行。
+    base_url: "https://api.openai.com/v1"
+    # OpenAI Chat Completions 首版不会使用 thinking 配置。
+    thinking: false
