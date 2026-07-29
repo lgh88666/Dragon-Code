@@ -181,6 +181,84 @@ User / Tool：把 Tool Result 发回给 Assistant
 工具描述本质上也是 Prompt Engineering。描述模糊时，即使工具代码完全正确，模型也可能
 选错工具或构造错误参数。
 
+### 三个重要的工具元信息
+
+#### `read_only`
+
+表示工具只读取信息，不修改文件或外部状态。
+
+典型工具：
+
+```text
+ReadFile
+Glob
+Grep
+```
+
+系统可以据此决定：
+
+- 默认放行，通常不需要用户确认。
+- 允许在 Plan Mode 中使用。
+- 多个只读操作通常可以并行。
+- 失败后通常可以安全重试。
+
+#### `destructive`
+
+表示工具可能修改文件、执行命令或改变外部状态。
+
+典型工具：
+
+```text
+WriteFile
+EditFile
+Bash
+```
+
+系统可以据此决定：
+
+- 执行前进入权限检查。
+- 必要时询问用户确认。
+- Plan Mode 中禁止使用。
+- 使用警告样式展示并保留审计信息。
+- 不能在失败后盲目自动重试。
+
+`Bash` 比较特殊，同一个工具既能执行 `git status`，也能执行删除文件的命令。初期可以把
+它整体标记为破坏性工具，后续权限系统再根据具体命令判断风险。
+
+#### `is_concurrency_safe`
+
+表示工具能否与其他工具同时执行，而不会发生状态冲突或产生不确定结果。
+
+```text
+ReadFile / Glob / Grep → 通常为 True
+WriteFile / EditFile   → 通常为 False
+Bash                   → 初期保守设为 False
+```
+
+Agent Loop 可以根据该字段分批调度：
+
+```text
+并发安全工具
+  → asyncio.gather(...) 同时执行
+
+非并发安全工具
+  → 按原始顺序逐个执行
+```
+
+例如两个 `EditFile` 同时修改同一个文件时，可能互相覆盖或让唯一匹配失效，因此不能并发。
+
+#### 三者的区别
+
+| 元信息 | 回答的问题 | 主要使用方 |
+|---|---|---|
+| `read_only` | 工具是否只读取状态？ | 权限系统、Plan Mode、重试策略 |
+| `destructive` | 工具是否可能改变状态？ | 权限确认、审计、UI 警告 |
+| `is_concurrency_safe` | 工具能否和其他工具一起运行？ | Agent Loop、工具调度器 |
+
+一句话记忆：
+
+> `read_only` 和 `destructive` 决定“需不需要防”，`is_concurrency_safe` 决定“能不能一起跑”。
+
 ## 每章源码回顾模板
 
 ### chXX：[模块名称]
