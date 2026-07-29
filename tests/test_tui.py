@@ -36,8 +36,11 @@ async def test_single_provider_layout():
 
         assert app.session_state is SessionState.IDLE
         banner = app.query_one("#banner", Static)
-        assert "Dragon Code" in str(banner.render())
-        assert banner.styles.color == Color.parse("#d13b3b")
+        banner_text = str(banner.render())
+        assert "▐██▙▄▟██▌" in banner_text
+        assert "Dragon Code" in banner_text
+        assert "Multi-provider coding agent" in banner_text
+        assert banner.styles.color == Color.parse("white")
         assert str(app.query_one("#provider-name", Static).render()) == "Fake"
         assert str(app.query_one("#model-name", Static).render()) == "fake-model"
         assert app.query_one("#message-input", MessageInput).has_focus

@@ -8,7 +8,7 @@ Screen {
     width: 1fr;
     height: auto;
     padding: 1 2 0 2;
-    color: #d13b3b;
+    color: white;
 }
 
 #ready {

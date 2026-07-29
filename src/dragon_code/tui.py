@@ -105,7 +105,7 @@ class DragonCodeApp(App):
         self.spinner_index = 0
 
     def compose(self) -> ComposeResult:
-        yield Static(render_banner(__version__, os.getcwd()), id="banner", markup=False)
+        yield Static(render_banner(__version__, os.getcwd()), id="banner")
         yield Static("● 对话服务已就绪", id="ready")
         yield RichLog(id="conversation", wrap=True, highlight=False, markup=False)
         yield Static("", id="streaming", markup=False)
