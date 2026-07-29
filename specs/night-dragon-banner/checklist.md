@@ -68,10 +68,12 @@
 
 ### tmux
 
-- [ ] 在 tmux 中启动并截图。
-- [ ] 输入真实对话请求并收到回复。
-- [x] 如果本机仍无 WSL/tmux，记录检测结果并保留前两项待验。
-  证据：此前检测 `Get-Command tmux` 返回 `TMUX_NOT_FOUND`，WSL 尚未安装。
+- [x] 在 tmux 中启动并截图。
+  证据：Ubuntu WSL 2 中使用 tmux 3.6 启动 Dragon Code，`capture-pane` 成功捕获完整 Banner。
+- [x] 输入真实对话请求并收到回复。
+  证据：输入“请用一句话介绍 Dragon Code。”，DeepSeek V4 Pro 在 3.1 秒内返回完整回复。
+- [x] WSL/tmux 环境可用。
+  证据：Ubuntu 运行于 WSL 2，项目目录可访问，tmux 版本为 3.6。
 
 ## 验收记录
 
