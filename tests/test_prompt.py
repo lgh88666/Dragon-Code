@@ -14,20 +14,21 @@ def test_dragon_banner_size_and_ascii():
 
 
 def test_dragon_banner_has_approved_features():
-    """龙头像应包含短角、双眼、脸部尖角和下颌。"""
+    """徽章应包含朝向三个方向的龙头和向下收拢的轮廓。"""
 
     lines = DRAGON_BANNER.splitlines()
 
-    assert lines[0].count("/\\") == 2
+    assert lines[0].strip() == "/^\\"
     assert DRAGON_BANNER.count("o") == 2
-    assert "<" in DRAGON_BANNER
-    assert ">" in DRAGON_BANNER
-    assert "===" in DRAGON_BANNER
+    assert lines[1].startswith("  <<==<")
+    assert lines[1].endswith(">==>>")
+    assert lines[-1].strip().startswith(r"\____")
+    assert lines[-1].strip().endswith("____/")
 
 
-def test_cat_features_are_removed():
-    assert "/\\_/\\" not in DRAGON_BANNER
-    assert "o.o" not in DRAGON_BANNER
+def test_old_dragon_features_are_removed():
+    assert "===" not in DRAGON_BANNER
+    assert "\\___/  \\___/" not in DRAGON_BANNER
 
 
 def test_render_banner_keeps_existing_text():

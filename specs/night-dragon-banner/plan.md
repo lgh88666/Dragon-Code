@@ -1,61 +1,88 @@
-# Dragon Code 夜行小龙 Banner Plan
+# Dragon Code 三头龙徽章 Banner Plan
 
-## 架构与修改范围
+## 架构概览
 
-本次不新增运行模块，只修改现有 Banner 资源并补充针对性测试。
-
-### `src/dragon_code/prompt.py`
-
-- 将 `CAT_BANNER` 替换为 `DRAGON_BANNER`。
-- 保存最终 5 行以内的纯 ASCII 夜行小龙头像。
-- `render_banner()` 改用新常量。
-- 应用名、版本、工作目录和就绪提示的拼接逻辑保持不变。
-
-### `tests/test_prompt.py`
-
-- 检查猫咪图案已消失。
-- 检查龙图案的行数、最大宽度和字符范围。
-- 检查版本、工作目录及就绪提示仍存在。
-
-### 不修改的模块
-
-`src/dragon_code/tui.py` 与 `src/dragon_code/dragon_code.tcss` 不修改。TUI 继续调用原来的
-`render_banner()`，现有模块交互保持不变。
+本次沿用现有 Banner 渲染链，不新增模块和依赖。字符画继续由 `prompt.py` 集中保存，
+颜色继续由 Textual CSS 控制。
 
 ```text
 DRAGON_BANNER
     → render_banner(version, cwd)
     → DragonCodeApp.compose()
-    → 顶部 Static 显示
+    → #banner Static
+    → dragon_code.tcss 设置红色
 ```
+
+## 核心接口
+
+### `DRAGON_BANNER`
+
+类型为普通字符串，保存恰好 5 行的纯 ASCII 三头龙徽章。
+
+### `render_banner(version: str, cwd: str) -> str`
+
+接口和返回类型保持不变。将字符画、应用名称、版本、工作目录和就绪提示拼成完整文本。
+
+## 模块设计
+
+### `src/dragon_code/prompt.py`
+
+**职责：** 保存系统提示词、三头龙字符画，并生成 Banner 文本。
+
+**改动：**
+
+- 替换现有 `DRAGON_BANNER` 内容。
+- 使用对称构图：中央龙头朝上，左右龙头分别朝外。
+- 左右展开部分表示双翼，下方轮廓向中央收拢，模拟环形徽章。
+- 更新常量旁的中文说明。
+- `render_banner()` 保持不变。
+
+### `src/dragon_code/dragon_code.tcss`
+
+**职责：** 控制 TUI 组件样式。
+
+**改动：**
+
+- 将 `#banner` 的颜色从主题强调色改为固定的深红色 `#d13b3b`。
+- 尺寸、内边距和其他样式保持不变。
+
+### `tests/test_prompt.py`
+
+**职责：** 验证图案内容和 Banner 文本。
+
+**改动：**
+
+- 保留 5 行、24 列、纯 ASCII 检查。
+- 将旧正面龙头特征检查改成三头龙特征检查。
+- 检查旧图案的眼睛和嘴部特征已经消失。
+- 保留应用名称、版本、目录和就绪提示检查。
+
+### `tests/test_tui.py`
+
+**职责：** 验证 Banner 在真实 Textual 应用中的样式和布局。
+
+**改动：**
+
+- 在现有启动测试中检查 `#banner` 的最终颜色为 `#d13b3b`。
+- 继续复用标准与窄终端布局测试。
 
 ## ASCII 图案设计
 
 ```text
-      /\     /\
-  ___/  \___/  \___
- /  \  o     o  /  \
-<    \    ^    /    >
- \____\__===__/____/
+       /^\
+  <<==<o o>==>>
+ /\/\  \^/  /\/\
+<    \ /|\ /    >
+ \____V_|_V____/
 ```
 
 设计说明：
 
-- 第一行表示短龙角。
-- 第二行表示圆润且有棱角的头顶。
-- 第三行使用倾斜眉线和大眼睛表现可爱与敏捷。
-- 第四行表示脸部尖角和小鼻子。
-- 第五行表示下颌和略带坏笑的嘴部。
-- 图案共 5 行，最长行不超过 24 列。
-- 全部使用 ASCII 字符。
-- 造型为原创，不包含具体影视角色的标志性细节。
-
-资源旁添加中文注释：
-
-```python
-# 原创夜行小龙头像：紧凑、终端友好，不复刻具体影视角色。
-DRAGON_BANNER = ...
-```
+- 第一、二行构成朝上的中央龙头。
+- 第二行两端的箭头状轮廓表示向左和向右的龙头。
+- 第三、四行使用展开的翼形轮廓连接三个龙头。
+- 第五行向中央收拢，体现环形徽章的下半部分。
+- 图案恰好 5 行，最长行不超过 24 列，全部使用 ASCII 字符。
 
 ## 文件组织
 
@@ -67,42 +94,31 @@ specs/night-dragon-banner/
 └── checklist.md
 
 src/dragon_code/
-└── prompt.py
+├── prompt.py
+└── dragon_code.tcss
 
 tests/
-└── test_prompt.py
+├── test_prompt.py
+└── test_tui.py
 ```
-
-## 测试设计
-
-`test_prompt.py` 验证：
-
-- `DRAGON_BANNER` 恰好为 5 行。
-- 每行宽度不超过 24 个字符。
-- 所有字符均为 ASCII。
-- 图案包含约定的眼睛和龙角特征。
-- 原猫咪特征字符串不再存在。
-- `render_banner()` 仍包含 Dragon Code、版本、工作目录和就绪提示。
-- 图案是 `render_banner()` 输出的首个内容块。
-
-现有 `test_tui.py` 继续验证 Banner 在标准和窄终端中可以显示。
 
 ## 技术决策
 
 | 决策点 | 选择 | 理由 |
 |---|---|---|
-| 图案常量 | `DRAGON_BANNER` | 名称与内容一致，删除猫咪语义 |
+| 构图 | 对称三头龙徽章 | 5 行内仍能明确表达三个朝向 |
 | 字符范围 | 纯 ASCII | 各终端字符宽度稳定 |
-| 字符串形式 | Python raw 多行字符串 | 反斜杠无需重复转义，图案容易阅读 |
-| 渲染入口 | 保留 `render_banner()` | 不影响 TUI 和其他调用方 |
-| 测试方式 | 尺寸、字符与关键特征测试 | 约束需求并允许未来微调造型 |
-| 新依赖 | 不增加 | 纯文本资源无需依赖 |
+| 字符串形式 | Python raw 多行字符串 | 反斜杠不需要重复转义，容易阅读 |
+| 颜色实现 | Textual CSS 固定深红色 | 实现简单，不改变 Python 渲染接口 |
+| 渲染入口 | 保留 `render_banner()` | 避免影响 TUI 和其他调用方 |
+| 测试方式 | 资源测试 + Textual Pilot | 同时验证字符画约束和最终界面样式 |
+| 新依赖 | 不增加 | 纯文本和 CSS 已满足需求 |
 
 ## Spec 覆盖检查
 
-- F1–F3：由 `DRAGON_BANNER` 和专项测试覆盖。
-- F4：保持 `render_banner()` 接口并测试原有文字。
-- F5：不修改 TUI、CSS 或其他运行模块。
-- N1–N4：尺寸、ASCII、集中定义及原创设计覆盖。
-- N5：完整测试和 Ruff 质量门禁覆盖。
-- 所有功能需求和验收标准均有明确实现或验证归属。
+- F1、F2、F4：由新 `DRAGON_BANNER` 和专项测试覆盖。
+- F3：由 `#banner` CSS 和 Textual Pilot 测试覆盖。
+- F5：保持 `render_banner()` 接口及原文字测试。
+- F6：不修改对话、Provider 和输入输出模块。
+- N1–N5：由尺寸、ASCII、布局、依赖和完整质量门禁覆盖。
+- 所有功能需求和验收标准都有明确实现或验证归属。
