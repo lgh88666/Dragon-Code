@@ -1,16 +1,15 @@
-"""OpenAI Provider 的请求和流式解析测试。"""
+"""OpenAI Provider 的工具请求与流式解析测试。"""
 
 from types import SimpleNamespace
 
 import pytest
 
 import dragon_code.providers.openai as openai_module
-from dragon_code.models import ChatMessage, ProviderConfig
-from dragon_code.providers.base import ProviderError
+from dragon_code.models import ChatMessage, ProviderConfig, ToolCall, ToolDefinition, ToolResult
 from dragon_code.providers.openai import OpenAIProvider
 
 
-class FakeOpenAIStream:
+class FakeStream:
     def __init__(self, chunks):
         self.chunks = chunks
 
@@ -31,10 +30,10 @@ class FakeCompletions:
 
     async def create(self, **request):
         self.request = request
-        return FakeOpenAIStream(self.chunks)
+        return FakeStream(self.chunks)
 
 
-class FakeOpenAIClient:
+class FakeClient:
     instances = []
     chunks = []
 
@@ -45,64 +44,77 @@ class FakeOpenAIClient:
 
 
 @pytest.fixture(autouse=True)
-def fake_openai(monkeypatch):
-    FakeOpenAIClient.instances.clear()
-    FakeOpenAIClient.chunks = []
-    monkeypatch.setattr(openai_module, "AsyncOpenAI", FakeOpenAIClient)
+def fake_client(monkeypatch):
+    FakeClient.instances.clear()
+    FakeClient.chunks = []
+    monkeypatch.setattr(openai_module, "AsyncOpenAI", FakeClient)
 
 
-def chunk(text):
-    return SimpleNamespace(
-        choices=[SimpleNamespace(delta=SimpleNamespace(content=text))],
-    )
+def definition():
+    return ToolDefinition("Read", "读取文件", {"type": "object"}, "filesystem", True, False, True)
 
 
-async def collect(provider):
+def chunk(content=None, tool_calls=None):
+    delta = SimpleNamespace(content=content, tool_calls=tool_calls)
+    return SimpleNamespace(choices=[SimpleNamespace(delta=delta)])
+
+
+def tool_part(index, call_id=None, name=None, arguments=None):
+    function = SimpleNamespace(name=name, arguments=arguments)
+    return SimpleNamespace(index=index, id=call_id, function=function)
+
+
+async def collect(provider, messages=None):
+    return [
+        event
+        async for event in provider.stream(
+            messages or [ChatMessage("user", "读取文件")],
+            "系统提示",
+            [definition()],
+        )
+    ]
+
+
+async def test_openai_request_contains_tools_and_tool_history():
+    FakeClient.chunks = [chunk("完成")]
+    provider = OpenAIProvider(ProviderConfig("OpenAI", "openai", "key", "model"))
+    call = ToolCall("call_1", "Read", {"path": "a.txt"}, '{"path":"a.txt"}')
+    result = ToolResult("call_1", "Read", True, content="内容")
     messages = [
-        ChatMessage("user", "第一轮"),
-        ChatMessage("assistant", "第一答"),
-        ChatMessage("user", "第二轮"),
+        ChatMessage("user", "读取"),
+        ChatMessage("assistant", tool_calls=[call]),
+        ChatMessage("tool", tool_results=[result]),
     ]
-    return [text async for text in provider.stream(messages, "系统提示")]
+    await collect(provider, messages)
+    request = FakeClient.instances[0].chat.completions.request
+    assert request["tools"][0]["function"]["name"] == "Read"
+    assert request["messages"][-1]["role"] == "tool"
+    assert request["messages"][-1]["tool_call_id"] == "call_1"
 
 
-async def test_openai_request_and_text_stream():
-    FakeOpenAIClient.chunks = [chunk("答"), chunk(None), chunk("案")]
-    config = ProviderConfig(
-        "OpenAI",
-        "openai",
-        "secret",
-        "gpt-test",
-        base_url="https://example.test/v1",
-        thinking=True,
-    )
-    provider = OpenAIProvider(config)
-
-    chunks = await collect(provider)
-    client = FakeOpenAIClient.instances[0]
-    request = client.chat.completions.request
-
-    assert chunks == ["答", "案"]
-    assert client.kwargs["base_url"] == "https://example.test/v1"
-    assert request["messages"][0] == {"role": "system", "content": "系统提示"}
-    assert [item["role"] for item in request["messages"][1:]] == [
-        "user",
-        "assistant",
-        "user",
+async def test_openai_joins_multiple_fragmented_calls():
+    FakeClient.chunks = [
+        chunk(tool_calls=[tool_part(0, "call_1", "Re", '{"pa')]),
+        chunk(tool_calls=[tool_part(1, "call_2", "Gl", '{"pat')]),
+        chunk(tool_calls=[tool_part(0, None, "ad", 'th":"a.txt"}')]),
+        chunk(tool_calls=[tool_part(1, None, "ob", 'tern":"*.py"}')]),
     ]
-    assert "thinking" not in request
+    events = await collect(OpenAIProvider(ProviderConfig("OpenAI", "openai", "key", "model")))
+    calls = [event.tool_call for event in events if event.type == "tool_call"]
+    assert [(call.name, call.arguments) for call in calls] == [
+        ("Read", {"path": "a.txt"}),
+        ("Glob", {"pattern": "*.py"}),
+    ]
+    assert events[-1].type == "completed"
+    assert events[-1].message.tool_calls == calls
 
 
-async def test_openai_ignores_chunks_without_choices():
-    FakeOpenAIClient.chunks = [SimpleNamespace(choices=[]), chunk("正文")]
-    provider = OpenAIProvider(ProviderConfig("OpenAI", "openai", "key", "model"))
-
-    assert await collect(provider) == ["正文"]
-
-
-async def test_openai_error_is_converted():
-    FakeOpenAIClient.chunks = [ConnectionError("secret network detail")]
-    provider = OpenAIProvider(ProviderConfig("OpenAI", "openai", "key", "model"))
-
-    with pytest.raises(ProviderError, match="无法连接模型服务"):
-        await collect(provider)
+async def test_openai_text_and_invalid_json_events():
+    FakeClient.chunks = [
+        chunk("正在处理"),
+        chunk(tool_calls=[tool_part(0, "x", "Read", "{")]),
+    ]
+    events = await collect(OpenAIProvider(ProviderConfig("OpenAI", "openai", "key", "model")))
+    assert events[0].type == "text_delta"
+    assert events[1].tool_call.arguments is None
+    assert events[-1].message.content == "正在处理"

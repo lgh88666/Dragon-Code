@@ -2,7 +2,7 @@
 
 from rich.text import Text
 
-from dragon_code.prompt import DRAGON_BANNER, render_banner
+from dragon_code.prompt import DRAGON_BANNER, build_system_prompt, render_banner
 
 
 def test_dragon_banner_matches_approved_icon():
@@ -53,3 +53,12 @@ def test_render_banner_uses_approved_styles():
     assert "white" in styles
     assert "bold white" in styles
     assert "grey70" in styles
+
+
+def test_system_prompt_contains_agent_rules(tmp_path):
+    prompt = build_system_prompt(tmp_path)
+    assert "Dragon Code" in prompt
+    assert str(tmp_path.resolve()) in prompt
+    assert "Read、Write、Edit、Bash、Glob、Grep" in prompt
+    assert "只执行一轮工具" in prompt
+    assert "仅支持文本对话" not in prompt

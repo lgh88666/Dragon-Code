@@ -2,7 +2,7 @@
 
 import asyncio
 
-from dragon_code.models import ProviderConfig
+from dragon_code.models import ChatMessage, ProviderConfig, ProviderEvent, ToolDefinition
 
 
 class ProviderError(Exception):
@@ -33,11 +33,16 @@ class BaseProvider:
 
         return self.config.model
 
-    async def stream(self, messages, system_prompt):
-        """流式返回正文增量，由子类实现。"""
+    async def stream(
+        self,
+        messages: list[ChatMessage],
+        system_prompt: str,
+        tools: list[ToolDefinition],
+    ):
+        """流式返回统一 ProviderEvent，由子类实现。"""
 
         raise NotImplementedError
-        yield  # pragma: no cover
+        yield ProviderEvent(type="completed")  # pragma: no cover
 
 
 def make_provider_error(error: Exception) -> ProviderError:
