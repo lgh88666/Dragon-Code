@@ -86,6 +86,7 @@ source = { editable = "." }
 dependencies = [
     { name = "anthropic" },
     { name = "openai" },
+    { name = "pydantic" },
     { name = "pyyaml" },
     { name = "rich" },
     { name = "textual" },
@@ -102,6 +103,7 @@ dev = [
 requires-dist = [
     { name = "anthropic", specifier = ">=0.75" },
     { name = "openai", specifier = ">=2.11" },
+    { name = "pydantic", specifier = ">=2,<3" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "rich", specifier = ">=14.0" },
     { name = "textual", specifier = ">=6.6,<7" },
