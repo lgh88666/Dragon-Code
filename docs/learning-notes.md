@@ -259,6 +259,121 @@ Agent Loop 可以根据该字段分批调度：
 
 > `read_only` 和 `destructive` 决定“需不需要防”，`is_concurrency_safe` 决定“能不能一起跑”。
 
+### ch03 核心源码回顾
+
+#### 文件职责
+
+| 文件 | 职责 |
+|---|---|
+| `src/dragon_code/models.py` | ToolDefinition、ToolCall、ToolResult、两层事件和统一消息 |
+| `src/dragon_code/tools/base.py` | 参数校验、超时和结构化异常的公共入口 |
+| `src/dragon_code/tools/file_tools.py` | Read、Write、Edit |
+| `src/dragon_code/tools/search_tools.py` | Glob、Grep |
+| `src/dragon_code/tools/bash.py` | 异步执行系统命令 |
+| `src/dragon_code/tools/registry.py` | 注册、查找并执行六个工具 |
+| `src/dragon_code/providers/openai.py` | 拼接 OpenAI tool_calls JSON 分片 |
+| `src/dragon_code/providers/anthropic.py` | 解析 tool_use，并保留隐藏 thinking 块 |
+| `src/dragon_code/session.py` | 一轮工具执行、结果回灌和一次最终续答 |
+| `src/dragon_code/tui.py` | 工具行、结果摘要和单轮上限提示 |
+
+#### ProviderEvent 与 TurnEvent
+
+这两个事件不是第三方协议，而是 Dragon Code 内部的简单数据包：
+
+```text
+模型 SDK
+  ↓ ProviderEvent：模型返回了什么
+ChatSession
+  ↓ TurnEvent：界面应该显示什么
+TUI
+```
+
+ProviderEvent 屏蔽 Anthropic 与 OpenAI 的流式格式差异。TurnEvent 还包含工具执行结果
+和单轮上限，因为这些信息不是模型 Provider 产生的，而是 ChatSession 协调出来的。
+
+#### 完整调用链
+
+```text
+用户提问
+  ↓
+Provider 注入六个工具定义
+  ↓
+模型返回 ToolCall
+  ↓
+ToolRegistry 按名称找到 Tool
+  ↓
+Tool.execute 校验参数、限制超时、包装错误
+  ↓
+具体工具执行并返回 ToolResult
+  ↓
+ChatSession 把 Assistant 工具调用与 ToolResult 加入临时历史
+  ↓
+Provider 发起一次最终续答
+  ↓
+TUI 流式显示最终答复
+```
+
+#### 两种协议的关键差异
+
+OpenAI 使用 `delta.tool_calls[index]` 传输调用，同一个工具的名称和 arguments JSON
+可能被拆成多个 chunk，必须按 index 分别拼接。工具结果使用 `role=tool`，并带
+`tool_call_id`。
+
+Anthropic 使用 `tool_use` 内容块和 JSON 增量。工具结果位于下一条 `user` 消息的
+`tool_result` 内容块中。开启扩展思考时，工具续答还必须原样带回对应的 `thinking`
+或 `redacted_thinking` 块，但这些内容绝不能渲染到 TUI。
+
+#### 结构化错误为什么重要
+
+文件不存在、参数缺失、非法 JSON、唯一匹配失败、非零退出和超时都属于 Agent 可以理解
+并处理的信息。如果直接抛出 Python 异常，会话会中断；转换成 ToolResult 后，模型可以
+在最终答复中说明实际失败原因。
+
+#### 路径保护
+
+文件类工具先用 `Path.resolve()` 得到真实路径，再检查它是否仍位于启动工作目录内。
+因此普通 `../` 和指向外部的符号链接都不能绕过边界。Bash 本章没有沙箱，仍被保守标记
+为 destructive，权限确认留到后续章节。
+
+#### 单轮上限
+
+ch03 只允许：
+
+```text
+第一次模型请求 → 一批工具 → 第二次模型请求 → 停止
+```
+
+第二次模型请求如果再次调用工具，ChatSession 不执行、不保存该调用，而是显示本地上限
+提示。这能清楚区分“工具系统”和下一章的“Agent Loop”。
+
+### ch03 测试与证据
+
+- 自动化测试覆盖六个工具、路径越界、输出截断、两种协议 JSON 分片、隐藏 thinking、
+  多工具顺序、结构化失败和单轮上限。
+- Ruff 格式与 lint、Python 编译、依赖锁检查均通过。
+- WSL/tmux + 真实 DeepSeek 已验证 Read 成功后续答，耗时 5.3 秒。
+- 真实不存在文件返回 `not_found`，随后会话仍可继续。
+- 真实 Write 创建并覆盖文件，磁盘内容为 `dragon_ok_2026`。
+- 真实 Grep 命中 `src/dragon_code/tools/registry.py:12`。
+- 真实 Glob 找到未知文件后，续答阶段的 Read 被单轮上限拦截。
+
+### ch03 踩坑记录
+
+- tmux `send-keys` 会把部分带连字符的文本解释成按键名称，端到端测试数据应使用简单
+  字母、数字和下划线，或采用更严格的文字输入方式。
+- Windows 默认权限可能不允许测试创建符号链接；普通绝对路径和 `../` 越界测试仍会
+  执行，符号链接场景在允许的平台验证。
+- Anthropic thinking 不能简单“接收后丢弃”：工具续答要求保留签名内容块，只能做到
+  “不展示但原样回灌”。
+
+### ch03 面试表达
+
+> 我为终端编程助手设计了协议无关的工具系统。每个工具通过统一接口提供描述、JSON
+> Schema、安全元信息和异步执行入口，公共基类负责参数校验、超时与结构化错误。Provider
+> 适配器分别解析 OpenAI tool_calls 和 Anthropic tool_use 的流式 JSON 分片，再转换成
+> 统一事件。ChatSession 串行执行首轮工具、按协议回灌 ToolResult，并只允许一次最终续答，
+> 因而在实现真实 Agent 能力的同时明确控制了本章与 Agent Loop 的边界。
+
 ## 每章源码回顾模板
 
 ### chXX：[模块名称]

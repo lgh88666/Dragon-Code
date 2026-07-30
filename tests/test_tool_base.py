@@ -1,6 +1,7 @@
 """共享工具数据模型与 Tool 基类测试。"""
 
 import asyncio
+import json
 
 from pydantic import BaseModel, Field
 
@@ -32,8 +33,10 @@ def test_message_lists_are_isolated():
 def test_tool_result_json_is_readable():
     result = ToolResult("1", "Demo", False, error_code="bad", error_message="中文错误")
     text = result.to_model_text()
+    data = json.loads(text)
     assert "中文错误" in text
     assert "\\u" not in text
+    assert set(data) == {"success", "content", "error", "metadata", "truncated"}
 
 
 def test_definition_contains_schema_and_metadata():
