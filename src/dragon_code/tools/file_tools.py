@@ -130,6 +130,8 @@ class EditTool(WorkspaceTool):
                 "match_count",
                 f"原文必须恰好匹配 1 次，实际匹配 {matches} 次。",
             )
-        path.write_text(content.replace(arguments.old_text, arguments.new_text, 1), encoding="utf-8")
+        path.write_text(
+            content.replace(arguments.old_text, arguments.new_text, 1), encoding="utf-8"
+        )
         relative = str(path.relative_to(self.workdir))
         return self._success(call, f"已修改 {relative}", metadata={"path": relative, "matches": 1})

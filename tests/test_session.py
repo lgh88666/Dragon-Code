@@ -67,7 +67,9 @@ def test_conversation_returns_copy_and_commits_in_order():
     conversation = Conversation()
     request = conversation.build_request_messages("第一问")
     assert request == [ChatMessage("user", "第一问")]
-    conversation.commit_messages([ChatMessage("user", "第一问"), ChatMessage("assistant", "第一答")])
+    conversation.commit_messages(
+        [ChatMessage("user", "第一问"), ChatMessage("assistant", "第一答")]
+    )
     copied = conversation.get_messages()
     copied.clear()
     assert [item.role for item in conversation.get_messages()] == ["user", "assistant"]

@@ -56,7 +56,9 @@ class BashTool(Tool):
             "stderr": shown_stderr,
             "exit_code": process.returncode,
         }
-        content = f"stdout:\n{shown_stdout}\nstderr:\n{shown_stderr}\nexit_code: {process.returncode}"
+        content = (
+            f"stdout:\n{shown_stdout}\nstderr:\n{shown_stderr}\nexit_code: {process.returncode}"
+        )
         if process.returncode == 0:
             return self._success(call, content, metadata=metadata, truncated=truncated)
         return ToolResult(

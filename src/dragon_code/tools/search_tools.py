@@ -66,8 +66,7 @@ class GlobTool(SearchTool):
 class GrepTool(SearchTool):
     name = "Grep"
     description = (
-        "使用正则表达式搜索工作目录内的 UTF-8 文件，返回文件、行号和命中行。"
-        "查找文件名请使用 Glob。"
+        "使用正则表达式搜索工作目录内的 UTF-8 文件，返回文件、行号和命中行。查找文件名请使用 Glob。"
     )
     category = "search"
     read_only = True

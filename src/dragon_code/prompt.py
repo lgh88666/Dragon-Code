@@ -21,6 +21,7 @@ def build_system_prompt(workdir: Path) -> str:
 回答保持清晰、简洁，并说明实际完成了什么。
 """
 
+
 # 用户确认的原创翼形图标，字符和位置不要随意调整。
 DRAGON_BANNER = """
  ▗▄   ▄▖

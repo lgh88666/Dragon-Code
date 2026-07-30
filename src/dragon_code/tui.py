@@ -4,6 +4,7 @@ import os
 import time
 from collections.abc import Callable
 from enum import Enum
+from pathlib import Path
 
 from rich.console import Group
 from rich.markdown import Markdown
@@ -18,11 +19,47 @@ from textual.widgets import OptionList, RichLog, Static, TextArea
 from textual.worker import Worker
 
 from dragon_code import __version__
-from dragon_code.models import AppConfig, ProviderConfig
-from dragon_code.prompt import SYSTEM_PROMPT, render_banner
+from dragon_code.models import AppConfig, ProviderConfig, ToolCall, ToolResult
+from dragon_code.prompt import build_system_prompt, render_banner
 from dragon_code.providers.base import BaseProvider, ProviderError
 from dragon_code.providers.factory import create_provider
 from dragon_code.session import ChatSession, Conversation
+from dragon_code.tools import create_default_registry
+
+
+def format_tool_call(call: ToolCall) -> str:
+    """生成 Claude Code 风格的单行工具说明。"""
+
+    arguments = call.arguments or {}
+    if call.name in {"Read", "Write", "Edit"}:
+        key = arguments.get("path", "")
+    elif call.name == "Bash":
+        key = arguments.get("command", "")
+    elif call.name == "Glob":
+        key = arguments.get("pattern", "")
+    elif call.name == "Grep":
+        key = f"{arguments.get('pattern', '')}, {arguments.get('path', '.')}"
+    else:
+        key = ""
+    key = str(key).replace("\n", " ")
+    if len(key) > 100:
+        key = key[:97] + "..."
+    return f"● {call.name}({key})"
+
+
+def format_tool_result(result: ToolResult) -> str:
+    """只为 TUI 生成短摘要，完整内容仍只回灌给模型。"""
+
+    if result.success:
+        text = result.content or "执行成功"
+    else:
+        text = result.error_message or "执行失败"
+    text = text.replace("\n", " ")
+    if len(text) > 240:
+        text = text[:237] + "..."
+    if result.truncated:
+        text += "（结果已截断）"
+    return text
 
 
 class SessionState(Enum):
@@ -144,7 +181,13 @@ class DragonCodeApp(App):
     def _activate_provider(self, index: int) -> None:
         config = self.config.providers[index]
         self.provider = self.provider_factory(config)
-        self.session = ChatSession(self.provider, Conversation(), SYSTEM_PROMPT)
+        workdir = Path.cwd()
+        self.session = ChatSession(
+            self.provider,
+            Conversation(),
+            build_system_prompt(workdir),
+            create_default_registry(workdir),
+        )
         self.session_state = SessionState.IDLE
         self.query_one("#provider-name", Static).update(self.provider.name)
         self.query_one("#model-name", Static).update(self.provider.model)
@@ -200,14 +243,35 @@ class DragonCodeApp(App):
             if event.type == "text":
                 self.reply_buffer += event.text
                 self.query_one("#streaming", Static).update(self.reply_buffer)
+            elif event.type == "tool_call" and event.tool_call is not None:
+                self._flush_streaming_text()
+                line = Text(format_tool_call(event.tool_call), style="bold cyan")
+                self.query_one("#conversation", RichLog).write(line)
+            elif event.type == "tool_result" and event.tool_result is not None:
+                result = event.tool_result
+                style = "green" if result.success else "bold red"
+                prefix = "  └─ " if result.success else "  └─ 错误："
+                line = Text(prefix + format_tool_result(result), style=style)
+                self.query_one("#conversation", RichLog).write(line)
             elif event.type == "completed":
                 self._finish_with_reply(event.text)
+            elif event.type == "limit":
+                self._finish_with_limit(event.text)
             elif event.type == "error":
                 error = event.error
                 if isinstance(error, ProviderError):
                     self._finish_with_error(error)
                 else:
                     self._finish_with_error(ProviderError("unknown", "模型请求失败，请稍后再试。"))
+
+    def _flush_streaming_text(self) -> None:
+        """把工具调用前的模型文字固定到历史区。"""
+
+        if not self.reply_buffer:
+            return
+        self.query_one("#conversation", RichLog).write(Markdown(self.reply_buffer))
+        self.reply_buffer = ""
+        self.query_one("#streaming", Static).update("")
 
     def _update_timer(self) -> None:
         """刷新等待动画和已用秒数。"""
@@ -255,6 +319,13 @@ class DragonCodeApp(App):
         self._stop_turn()
         message = Text(f"● {error.message}", style="bold red")
         self.query_one("#conversation", RichLog).write(message)
+
+    def _finish_with_limit(self, message: str) -> None:
+        """显示单轮工具上限，并恢复输入状态。"""
+
+        self._flush_streaming_text()
+        self._stop_turn()
+        self.query_one("#conversation", RichLog).write(Text(f"● {message}", style="bold yellow"))
 
     def action_safe_quit(self) -> None:
         """清理计时器和 Worker 后退出。"""

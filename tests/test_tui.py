@@ -6,9 +6,22 @@ from conftest import FakeProvider
 from textual.color import Color
 from textual.widgets import OptionList, RichLog, Static
 
-from dragon_code.models import AppConfig, ProviderConfig
+from dragon_code.models import (
+    AppConfig,
+    ChatMessage,
+    ProviderConfig,
+    ProviderEvent,
+    ToolCall,
+    ToolResult,
+)
 from dragon_code.providers.base import ProviderError
-from dragon_code.tui import DragonCodeApp, MessageInput, SessionState
+from dragon_code.tui import (
+    DragonCodeApp,
+    MessageInput,
+    SessionState,
+    format_tool_call,
+    format_tool_result,
+)
 
 
 def provider_config(name: str = "Fake", model: str = "fake-model") -> ProviderConfig:
@@ -109,11 +122,12 @@ async def test_error_recovers_and_next_turn_succeeds():
             super().__init__()
             self.calls = 0
 
-        async def stream(self, messages, system_prompt):
+        async def stream(self, messages, system_prompt, tools):
             self.calls += 1
             if self.calls == 1:
                 raise ProviderError("authentication", "鉴权失败")
-            yield "恢复成功"
+            yield ProviderEvent("text_delta", text="恢复成功")
+            yield ProviderEvent("completed", message=ChatMessage("assistant", "恢复成功"))
 
     provider = FailThenSucceedProvider()
     app = app_with_provider(provider)
@@ -140,10 +154,10 @@ async def test_streaming_rejects_second_submit():
             super().__init__(chunks=["完成"], delay=0.1)
             self.calls = 0
 
-        async def stream(self, messages, system_prompt):
+        async def stream(self, messages, system_prompt, tools):
             self.calls += 1
-            async for text in super().stream(messages, system_prompt):
-                yield text
+            async for event in super().stream(messages, system_prompt, tools):
+                yield event
 
     provider = CountingProvider()
     app = app_with_provider(provider)
@@ -190,3 +204,13 @@ async def test_narrow_terminal_keeps_main_widgets():
         assert app.query_one("#conversation", RichLog).region.width > 0
         assert app.query_one("#message-input", MessageInput).region.width > 0
         assert Path(app.CSS_PATH).name == "dragon_code.tcss"
+
+
+def test_tool_line_and_result_summary_are_short():
+    call = ToolCall("1", "Read", {"path": "src/app.py"})
+    success = ToolResult("1", "Read", True, content="x" * 500, truncated=True)
+    failure = ToolResult("2", "Read", False, error_message="文件不存在")
+    assert format_tool_call(call) == "● Read(src/app.py)"
+    assert len(format_tool_result(success)) < 270
+    assert "已截断" in format_tool_result(success)
+    assert format_tool_result(failure) == "文件不存在"

@@ -45,7 +45,9 @@ class Tool:
         """统一校验参数、限制超时并包装错误。"""
 
         if call.arguments is None:
-            return self._failure(call, "invalid_json", call.parse_error or "工具参数不是有效 JSON。")
+            return self._failure(
+                call, "invalid_json", call.parse_error or "工具参数不是有效 JSON。"
+            )
 
         try:
             arguments = self.arguments_model.model_validate(call.arguments)

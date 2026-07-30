@@ -2,7 +2,7 @@
 
 import asyncio
 
-from dragon_code.models import ChatMessage, ProviderEvent, TurnEvent
+from dragon_code.models import ChatMessage, TurnEvent
 from dragon_code.providers.base import BaseProvider, ProviderError
 from dragon_code.tools.registry import ToolRegistry
 
