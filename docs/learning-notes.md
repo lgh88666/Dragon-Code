@@ -374,6 +374,84 @@ ch03 只允许：
 > 统一事件。ChatSession 串行执行首轮工具、按协议回灌 ToolResult，并只允许一次最终续答，
 > 因而在实现真实 Agent 能力的同时明确控制了本章与 Agent Loop 的边界。
 
+## 聊天历史选择与复制：核心源码回顾
+
+### 模块目标
+
+- 解决的问题：用户可以从 Dragon Code 历史区拖选并复制代码、命令和回复。
+- 用户可观察行为：有选择时 `Ctrl+C` 复制，无选择时 `Ctrl+C` 退出。
+- 明确不做：复制按钮、键盘扩展选择、会话持久化和消息组件重写。
+
+### 文件职责
+
+| 文件 | 职责 |
+|---|---|
+| `src/dragon_code/tui.py` | 提取 RichLog 选择文本，处理复制/退出分流 |
+| `tests/test_tui.py` | 模拟真实鼠标拖选并验证剪贴板、继续对话和退出 |
+
+### 核心调用链
+
+```text
+鼠标在 ConversationLog 中拖动
+  ↓
+render_line() 提供每个字符的位置元信息
+  ↓
+Textual Screen 记录 Selection
+  ↓
+用户按 Ctrl+C
+  ↓
+action_copy_or_quit()
+  ├─ Selection 非空 → copy_to_clipboard() → OSC 52 → 终端剪贴板
+  └─ Selection 为空 → action_safe_quit()
+```
+
+### 为什么需要 `ConversationLog`
+
+当前 Textual 6.12 的 `RichLog` 会渲染 Rich/Markdown 对象，但其默认选择逻辑无法从这种
+渲染结果中取得文字，而且渲染行没有供鼠标选择使用的位置元信息。因此界面看似支持
+选择，实际 `Screen.get_selected_text()` 得到空内容。
+
+`ConversationLog` 仍然继承 `RichLog`，只补两件事：
+
+1. `render_line()` 调用 `apply_offsets()`，让 Textual 能把鼠标坐标换成行列下标，并把
+   当前选择范围高亮。
+2. `get_selection()` 从已经渲染的行中组合纯文本，再按 `Selection` 提取。
+
+它没有改变消息写入、Markdown 渲染、滚动或工具行逻辑。
+
+### OSC 52 是什么
+
+OSC 52 是终端控制序列。程序不能像桌面 GUI 那样直接操作所有平台的系统剪贴板，
+Textual 会把选择内容编码后发送 OSC 52，由 Windows Terminal 等外层终端决定是否写入
+系统剪贴板。
+
+tmux 位于应用和外层终端之间。当前环境的 `set-clipboard=external` 允许应用发出的
+OSC 52 继续交给外层终端。后台分离的 tmux 没有外层终端客户端，因此可以验证应用没有
+退出，却不能在后台读取 Windows 系统剪贴板。
+
+### 重要边界
+
+- `if selected_text:` 同时排除了 `None` 和空字符串，避免空选择阻止退出。
+- 复制后不清除选择，所以连续按 `Ctrl+C` 会继续复制；按 `Escape` 或单击其他位置可以
+  清除选择。
+- 鼠标点击历史区后输入框可能失去焦点；继续对话时重新点击输入框或按 `Tab` 即可。
+- Textual 把终端单元格坐标转换为字符下标，因此中文等双宽字符也能正确选择。
+
+### 测试与证据
+
+- 自动化测试真实组合鼠标按下、拖动和松开事件，并精确比较剪贴板文字。
+- 内容覆盖用户消息、助手 Markdown、代码块、工具行和错误行。
+- 完整测试结果：`70 passed, 1 skipped`。
+- WSL/tmux + DeepSeek 验证：选择 `COPY_READY` 后复制不退出，随后正常得到第二轮
+  `CONTINUE_OK`；清除选择后 `Ctrl+C` 安全退出。
+
+### 面试表达
+
+> 我修复了 Textual RichLog 在 Rich/Markdown 渲染下无法实际选择文字的问题。通过一个
+> 很小的 RichLog 子类为渲染行附加字符位置，并从 Selection 中提取纯文本；同时把
+> Ctrl+C 设计成条件动作，有选择就通过 OSC 52 复制，没有选择就安全退出。测试不仅断言
+> 剪贴板内容，还在 WSL/tmux 中发送真实鼠标序列验证了复制、继续对话和退出三条路径。
+
 ## 每章源码回顾模板
 
 ### chXX：[模块名称]

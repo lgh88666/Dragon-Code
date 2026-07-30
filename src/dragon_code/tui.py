@@ -14,6 +14,8 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.message import Message
 from textual.screen import ModalScreen
+from textual.selection import Selection
+from textual.strip import Strip
 from textual.timer import Timer
 from textual.widgets import OptionList, RichLog, Static, TextArea
 from textual.worker import Worker
@@ -70,6 +72,42 @@ class SessionState(Enum):
     STREAMING = "streaming"
 
 
+class ConversationLog(RichLog):
+    """让 RichLog 已渲染的聊天行可以被 Textual 正确复制。"""
+
+    def render_line(self, y: int) -> Strip:
+        """给渲染行附加文字位置，并高亮当前选择。"""
+
+        scroll_x, scroll_y = self.scroll_offset
+        line = super().render_line(y)
+        selection = self.text_selection
+
+        if selection is not None:
+            span = selection.get_span(scroll_y + y)
+            if span is not None:
+                start, end = span
+                rich_text = Text()
+                for segment in line:
+                    rich_text.append(segment.text, style=segment.style)
+                if end == -1:
+                    end = len(rich_text)
+                selection_style = self.screen.get_component_rich_style("screen--selection")
+                rich_text.stylize(selection_style, start, end)
+                line = Strip(rich_text.render(self.app.console), line.cell_length)
+
+        # Textual 依靠这些位置元信息，把鼠标坐标换算成文字下标。
+        return line.apply_offsets(scroll_x, scroll_y + y)
+
+    def get_selection(self, selection: Selection) -> tuple[str, str] | None:
+        """根据鼠标选择范围提取聊天区中的纯文本。"""
+
+        if not self.lines:
+            return None
+
+        text = "\n".join(line.text.rstrip() for line in self.lines)
+        return selection.extract(text), "\n"
+
+
 class MessageInput(TextArea):
     """支持 Enter 提交、Alt+Enter 换行的输入框。"""
 
@@ -121,7 +159,7 @@ class DragonCodeApp(App):
 
     CSS_PATH = "dragon_code.tcss"
     BINDINGS = [
-        Binding("ctrl+c", "safe_quit", show=False, priority=True),
+        Binding("ctrl+c", "copy_or_quit", show=False, priority=True),
     ]
 
     def __init__(
@@ -144,7 +182,7 @@ class DragonCodeApp(App):
     def compose(self) -> ComposeResult:
         yield Static(render_banner(__version__, os.getcwd()), id="banner")
         yield Static("● 对话服务已就绪", id="ready")
-        yield RichLog(id="conversation", wrap=True, highlight=False, markup=False)
+        yield ConversationLog(id="conversation", wrap=True, highlight=False, markup=False)
         yield Static("", id="streaming", markup=False)
         yield Static("", id="timer", markup=False)
         with Horizontal(id="input-row"):
@@ -337,3 +375,13 @@ class DragonCodeApp(App):
             self.stream_worker.cancel()
             self.stream_worker = None
         self.exit()
+
+    def action_copy_or_quit(self) -> None:
+        """有选中文字时复制，否则沿用 Ctrl+C 安全退出。"""
+
+        selected_text = self.screen.get_selected_text()
+        if selected_text:
+            self.copy_to_clipboard(selected_text)
+            return
+
+        self.action_safe_quit()

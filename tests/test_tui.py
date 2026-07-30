@@ -3,7 +3,10 @@
 from pathlib import Path
 
 from conftest import FakeProvider
+from rich.markdown import Markdown
+from rich.text import Text
 from textual.color import Color
+from textual.events import MouseMove
 from textual.widgets import OptionList, RichLog, Static
 
 from dragon_code.models import (
@@ -182,6 +185,67 @@ async def test_exit_command():
         await pilot.pause()
 
         assert app.is_running is False
+
+
+async def test_ctrl_c_copies_selection_and_keeps_running():
+    provider = FakeProvider(chunks=["仍可继续"])
+    app = app_with_provider(provider)
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        conversation = app.query_one("#conversation", RichLog)
+        conversation.write("需要复制的聊天内容")
+        await pilot.pause()
+
+        # Pilot 没有公开的 drag 方法，因此组合鼠标按下、移动和松开来模拟拖选。
+        await pilot.mouse_down(conversation, offset=(0, 0))
+        await pilot._post_mouse_events(
+            [MouseMove],
+            conversation,
+            offset=(18, 0),
+            button=1,
+        )
+        await pilot.mouse_up(conversation, offset=(18, 0))
+        selected_text = app.screen.get_selected_text()
+        assert selected_text is not None
+        assert selected_text == "需要复制的聊天内容"
+
+        line_count = len(conversation.lines)
+        await pilot.press("ctrl+c")
+        await pilot.pause()
+
+        assert app.clipboard == selected_text
+        assert app.is_running is True
+        assert len(conversation.lines) == line_count
+
+        input_widget = app.query_one("#message-input", MessageInput)
+        input_widget.focus()
+        input_widget.load_text("复制后继续对话")
+        await pilot.press("enter")
+        await wait_until_idle(app, pilot)
+
+        assert provider.received_messages[-1].content == "复制后继续对话"
+
+
+async def test_chat_history_selection_includes_all_message_types():
+    app = app_with_provider(FakeProvider())
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        conversation = app.query_one("#conversation", RichLog)
+        conversation.write(Text("❯ 用户消息"))
+        conversation.write(Markdown("助手回复\n\n```python\nprint('dragon')\n```"))
+        conversation.write(Text("● Read(src/app.py)"))
+        conversation.write(Text("错误：文件不存在"))
+        await pilot.pause()
+
+        conversation.text_select_all()
+        selected_text = app.screen.get_selected_text()
+
+        assert selected_text is not None
+        assert "用户消息" in selected_text
+        assert "助手回复" in selected_text
+        assert "print('dragon')" in selected_text
+        assert "Read(src/app.py)" in selected_text
+        assert "文件不存在" in selected_text
 
 
 async def test_ctrl_c_exit():
