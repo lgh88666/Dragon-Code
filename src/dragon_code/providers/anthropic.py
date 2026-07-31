@@ -9,6 +9,7 @@ from dragon_code.models import (
     ChatMessage,
     ProviderConfig,
     ProviderEvent,
+    TokenUsage,
     ToolCall,
     ToolDefinition,
 )
@@ -110,7 +111,16 @@ class AnthropicProvider(BaseProvider):
                 buffers: dict[int, dict[str, str]] = {}
                 calls: list[ToolCall] = []
                 hidden_blocks: list[dict] = []
+                usage = TokenUsage()
                 async for event in response:
+                    if event.type == "message_start":
+                        message_usage = getattr(event.message, "usage", None)
+                        usage.input_tokens = getattr(message_usage, "input_tokens", None)
+                        continue
+                    if event.type == "message_delta":
+                        delta_usage = getattr(event, "usage", None)
+                        usage.output_tokens = getattr(delta_usage, "output_tokens", None)
+                        continue
                     if event.type == "text":
                         reply_parts.append(event.text)
                         yield ProviderEvent(type="text_delta", text=event.text)
@@ -125,11 +135,15 @@ class AnthropicProvider(BaseProvider):
                             }
                         continue
                     if event.type == "input_json":
-                        buffer = buffers.setdefault(
-                            event.index,
-                            {"id": "", "name": "", "arguments": ""},
-                        )
-                        buffer["arguments"] += event.partial_json
+                        # Anthropic SDK 的高级 input_json 事件没有 index。
+                        # 真实 JSON 已由紧邻的 content_block_delta 原始事件收集。
+                        index = getattr(event, "index", None)
+                        if index is not None:
+                            buffer = buffers.setdefault(
+                                index,
+                                {"id": "", "name": "", "arguments": ""},
+                            )
+                            buffer["arguments"] += event.partial_json
                         continue
                     if event.type == "content_block_delta":
                         delta = getattr(event, "delta", None)
@@ -182,6 +196,7 @@ class AnthropicProvider(BaseProvider):
                     tool_calls=calls,
                     hidden_blocks=hidden_blocks,
                 )
+                yield ProviderEvent(type="usage", usage=usage)
                 yield ProviderEvent(type="completed", message=message)
         except asyncio.CancelledError:
             raise

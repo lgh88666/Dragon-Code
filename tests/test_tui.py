@@ -1,5 +1,6 @@
 """Dragon Code Textual 界面测试。"""
 
+import asyncio
 from pathlib import Path
 
 from conftest import FakeProvider
@@ -14,9 +15,11 @@ from dragon_code.models import (
     ChatMessage,
     ProviderConfig,
     ProviderEvent,
+    TokenUsage,
     ToolCall,
     ToolResult,
 )
+from dragon_code.prompt import DO_PLAN_PROMPT
 from dragon_code.providers.base import ProviderError
 from dragon_code.tui import (
     DragonCodeApp,
@@ -34,6 +37,28 @@ def provider_config(name: str = "Fake", model: str = "fake-model") -> ProviderCo
 def app_with_provider(fake_provider: FakeProvider) -> DragonCodeApp:
     config = AppConfig([provider_config(fake_provider.name, fake_provider.model)])
     return DragonCodeApp(config, provider_factory=lambda _config: fake_provider)
+
+
+def complete_response(
+    content: str,
+    *,
+    calls: list[ToolCall] | None = None,
+    usage: tuple[int, int] = (10, 2),
+) -> list[ProviderEvent]:
+    """生成一轮完整的 FakeProvider 响应。"""
+
+    calls = calls or []
+    events = [ProviderEvent("tool_call", tool_call=call) for call in calls]
+    events.extend(
+        [
+            ProviderEvent("usage", usage=TokenUsage(*usage)),
+            ProviderEvent(
+                "completed",
+                message=ChatMessage("assistant", content, tool_calls=calls),
+            ),
+        ]
+    )
+    return events
 
 
 async def wait_until_idle(app: DragonCodeApp, pilot, attempts: int = 30):
@@ -117,6 +142,235 @@ async def test_streaming_completion_and_markdown():
         assert app.reply_buffer == "**你好**"
         assert str(app.query_one("#streaming", Static).render()) == ""
         assert len(app.query_one("#conversation", RichLog).lines) > 0
+
+
+async def test_progress_and_token_usage_are_visible():
+    provider = FakeProvider(
+        responses=[
+            complete_response("第一答", usage=(10, 3)),
+            complete_response("第二答", usage=(5, 2)),
+        ]
+    )
+    app = app_with_provider(provider)
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        input_widget = app.query_one("#message-input", MessageInput)
+        input_widget.load_text("第一问")
+        await pilot.press("enter")
+        await wait_until_idle(app, pilot)
+
+        assert app.current_iteration == 1
+        assert app.max_iterations == 50
+        assert app.session_usage == TokenUsage(10, 3)
+
+        input_widget.load_text("第二问")
+        await pilot.press("enter")
+        await wait_until_idle(app, pilot)
+
+        token_text = str(app.query_one("#token-usage", Static).render())
+        assert app.session_usage == TokenUsage(15, 5)
+        assert "Token 20" in token_text
+        assert "输入 15" in token_text
+        assert "输出 5" in token_text
+
+
+async def test_tool_events_render_in_scrollback_in_order():
+    call = ToolCall("read-1", "Read", {"path": "pyproject.toml"})
+    provider = FakeProvider(
+        responses=[
+            complete_response("先读取", calls=[call]),
+            complete_response("读取完成"),
+        ]
+    )
+    app = app_with_provider(provider)
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        app.query_one("#message-input", MessageInput).load_text("读取配置")
+        await pilot.press("enter")
+        await wait_until_idle(app, pilot)
+
+        conversation = app.query_one("#conversation", RichLog)
+        conversation.text_select_all()
+        selected = app.screen.get_selected_text() or ""
+        assert selected.index("Read(pyproject.toml)") < selected.index("读取完成")
+        assert "project" in selected
+
+
+async def test_tool_result_states_have_distinct_labels():
+    app = app_with_provider(FakeProvider())
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        app._write_tool_result(ToolResult("1", "Read", True, content="成功"))
+        app._write_tool_result(
+            ToolResult(
+                "2",
+                "Read",
+                False,
+                error_code="not_found",
+                error_message="文件不存在",
+            )
+        )
+        app._write_tool_result(
+            ToolResult(
+                "3",
+                "Bash",
+                False,
+                error_code="cancelled",
+                error_message="尚未开始",
+            )
+        )
+        app._write_tool_result(
+            ToolResult(
+                "4",
+                "Bash",
+                False,
+                error_code="cancel_outcome_unknown",
+                error_message="无法确认",
+            )
+        )
+        await pilot.pause()
+
+        conversation = app.query_one("#conversation", RichLog)
+        conversation.text_select_all()
+        selected = app.screen.get_selected_text() or ""
+        assert "└─ 成功" in selected
+        assert "└─ 错误：文件不存在" in selected
+        assert "└─ 已取消：尚未开始" in selected
+        assert "└─ 状态未知：无法确认" in selected
+
+
+async def test_plan_mode_and_do_command():
+    provider = FakeProvider(
+        responses=[
+            complete_response("计划：先读取，再修改"),
+            complete_response("已经按计划完成"),
+        ]
+    )
+    app = app_with_provider(provider)
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        input_widget = app.query_one("#message-input", MessageInput)
+        input_widget.load_text("/plan")
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert app.agent is not None
+        assert app.agent.mode == "plan"
+        assert len(provider.requests) == 0
+        assert "Plan Mode" in str(app.query_one("#ready", Static).render())
+
+        input_widget.load_text("分析修改方案")
+        await pilot.press("enter")
+        await wait_until_idle(app, pilot)
+
+        assert app.agent.can_execute_plan() is True
+        assert [tool.name for tool in provider.requests[0]["tools"]] == [
+            "Read",
+            "Glob",
+            "Grep",
+        ]
+
+        input_widget.load_text("/do")
+        await pilot.press("enter")
+        await wait_until_idle(app, pilot)
+
+        assert app.agent.mode == "default"
+        assert provider.requests[1]["messages"][-1].content == DO_PLAN_PROMPT
+        assert len(provider.requests[1]["tools"]) == 6
+        assert "对话服务已就绪" in str(app.query_one("#ready", Static).render())
+
+
+async def test_plan_with_inline_task_and_do_without_plan():
+    provider = FakeProvider(responses=[complete_response("内联计划")])
+    app = app_with_provider(provider)
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        input_widget = app.query_one("#message-input", MessageInput)
+        input_widget.load_text("/do")
+        await pilot.press("enter")
+        await pilot.pause()
+        assert len(provider.requests) == 0
+
+        input_widget.load_text("/plan 分析项目结构")
+        await pilot.press("enter")
+        await wait_until_idle(app, pilot)
+
+        assert provider.requests[0]["messages"][-1].content == "分析项目结构"
+        assert app.agent is not None
+        assert app.agent.can_execute_plan() is True
+
+
+class CancelThenSucceedProvider(FakeProvider):
+    """第一轮阻塞供取消，第二轮正常完成。"""
+
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+        self.started = asyncio.Event()
+        self.closed = False
+
+    async def stream(self, messages, system_prompt, tools):
+        self.calls += 1
+        if self.calls == 1:
+            try:
+                self.started.set()
+                yield ProviderEvent("text_delta", text="部分回复")
+                await asyncio.sleep(10)
+            finally:
+                self.closed = True
+            return
+
+        yield ProviderEvent("text_delta", text="取消后恢复成功")
+        yield ProviderEvent("usage", usage=TokenUsage(2, 1))
+        yield ProviderEvent(
+            "completed",
+            message=ChatMessage("assistant", "取消后恢复成功"),
+        )
+
+
+async def test_escape_cancels_turn_and_next_message_succeeds():
+    provider = CancelThenSucceedProvider()
+    app = app_with_provider(provider)
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        input_widget = app.query_one("#message-input", MessageInput)
+        input_widget.load_text("慢任务")
+        await pilot.press("enter")
+        await provider.started.wait()
+
+        await pilot.press("escape")
+        await wait_until_idle(app, pilot)
+
+        assert app.is_running is True
+        assert provider.closed is True
+        assert app.agent is not None
+        assert app.agent.conversation.get_messages() == []
+
+        input_widget.load_text("继续")
+        await pilot.press("enter")
+        await wait_until_idle(app, pilot)
+
+        assert provider.calls == 2
+        assert app.reply_buffer == "取消后恢复成功"
+
+
+async def test_ctrl_c_cancels_streaming_but_idle_escape_does_nothing():
+    provider = CancelThenSucceedProvider()
+    app = app_with_provider(provider)
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.press("escape")
+        await pilot.pause()
+        assert app.is_running is True
+
+        app.query_one("#message-input", MessageInput).load_text("慢任务")
+        await pilot.press("enter")
+        await provider.started.wait()
+        await pilot.press("ctrl+c")
+        await wait_until_idle(app, pilot)
+
+        assert app.is_running is True
+        assert provider.closed is True
 
 
 async def test_error_recovers_and_next_turn_succeeds():

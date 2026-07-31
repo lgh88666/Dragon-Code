@@ -6,12 +6,14 @@ import pytest
 
 import dragon_code.providers.openai as openai_module
 from dragon_code.models import ChatMessage, ProviderConfig, ToolCall, ToolDefinition, ToolResult
+from dragon_code.providers.base import ProviderError
 from dragon_code.providers.openai import OpenAIProvider
 
 
 class FakeStream:
     def __init__(self, chunks):
         self.chunks = chunks
+        self.closed = False
 
     def __aiter__(self):
         return self._iterate()
@@ -22,6 +24,9 @@ class FakeStream:
                 raise chunk
             yield chunk
 
+    async def close(self):
+        self.closed = True
+
 
 class FakeCompletions:
     def __init__(self, chunks):
@@ -30,7 +35,8 @@ class FakeCompletions:
 
     async def create(self, **request):
         self.request = request
-        return FakeStream(self.chunks)
+        self.stream = FakeStream(self.chunks)
+        return self.stream
 
 
 class FakeClient:
@@ -56,7 +62,15 @@ def definition():
 
 def chunk(content=None, tool_calls=None):
     delta = SimpleNamespace(content=content, tool_calls=tool_calls)
-    return SimpleNamespace(choices=[SimpleNamespace(delta=delta)])
+    return SimpleNamespace(choices=[SimpleNamespace(delta=delta)], usage=None)
+
+
+def usage_chunk(prompt_tokens, completion_tokens):
+    usage = SimpleNamespace(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+    )
+    return SimpleNamespace(choices=[], usage=usage)
 
 
 def tool_part(index, call_id=None, name=None, arguments=None):
@@ -118,3 +132,26 @@ async def test_openai_text_and_invalid_json_events():
     assert events[0].type == "text_delta"
     assert events[1].tool_call.arguments is None
     assert events[-1].message.content == "正在处理"
+
+
+async def test_openai_reads_usage_only_chunk_and_closes_stream():
+    FakeClient.chunks = [chunk("完成"), usage_chunk(20, 4)]
+    provider = OpenAIProvider(ProviderConfig("OpenAI", "openai", "key", "model"))
+    events = await collect(provider)
+
+    usage_event = next(event for event in events if event.type == "usage")
+    completions = FakeClient.instances[0].chat.completions
+    assert completions.request["stream_options"] == {"include_usage": True}
+    assert usage_event.usage.input_tokens == 20
+    assert usage_event.usage.output_tokens == 4
+    assert completions.stream.closed is True
+
+
+async def test_openai_closes_stream_after_error():
+    FakeClient.chunks = [RuntimeError("broken")]
+    provider = OpenAIProvider(ProviderConfig("OpenAI", "openai", "key", "model"))
+
+    with pytest.raises(ProviderError):
+        await collect(provider)
+
+    assert FakeClient.instances[0].chat.completions.stream.closed is True

@@ -5,6 +5,17 @@ from pathlib import Path
 
 from rich.text import Text
 
+PLAN_MODE_PROMPT = """
+当前处于 Plan Mode。
+你只能探索项目、分析需求并完善实现计划，不能修改任何文件，也不能执行命令。
+仅使用 Read、Glob、Grep 获取必要信息。
+最终在对话中给出清晰、可执行的计划，并等待用户继续调整或输入 /do。
+""".strip()
+
+DO_PLAN_PROMPT = """
+请根据上文已经确认的最新计划开始执行。使用可用工具完成任务，遇到工具错误时根据结果调整方案，直到给出最终答复。
+""".strip()
+
 
 def build_system_prompt(workdir: Path) -> str:
     """根据本次启动环境构建 Agent 提示词。"""
@@ -17,9 +28,17 @@ def build_system_prompt(workdir: Path) -> str:
 文件工具只能访问当前工作目录及其子目录。
 不要声称已经读取、修改或执行任何内容，除非工具结果明确表明操作成功。
 工具失败时，请根据结构化错误调整最终答复。
-当前版本每个用户请求只执行一轮工具；请尽量在首轮一次请求所需的全部工具。
+你可以根据工具结果继续调用工具，直到任务真正完成。
 回答保持清晰、简洁，并说明实际完成了什么。
 """
+
+
+def build_agent_prompt(base_prompt: str, mode: str) -> str:
+    """根据当前模式追加行为约束。"""
+
+    if mode == "plan":
+        return f"{base_prompt.rstrip()}\n\n{PLAN_MODE_PROMPT}\n"
+    return base_prompt
 
 
 # 用户确认的原创翼形图标，字符和位置不要随意调整。

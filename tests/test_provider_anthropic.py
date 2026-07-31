@@ -112,6 +112,37 @@ async def test_anthropic_joins_tool_json_and_hides_thinking():
     assert events[-1].message.hidden_blocks[0]["signature"] == "signed"
 
 
+async def test_anthropic_accepts_real_sdk_input_json_without_index():
+    """真实 SDK 同时给出原始 delta 和不带 index 的高级事件。"""
+
+    tool_start = SimpleNamespace(type="tool_use", id="u1", name="Read", input={})
+    tool_stop = SimpleNamespace(type="tool_use", id="u1", name="Read", input={"path": "a.txt"})
+    FakeClient.events = [
+        SimpleNamespace(type="content_block_start", index=1, content_block=tool_start),
+        SimpleNamespace(
+            type="content_block_delta",
+            index=1,
+            delta=SimpleNamespace(
+                type="input_json_delta",
+                partial_json='{"path":"a.txt"}',
+            ),
+        ),
+        SimpleNamespace(
+            type="input_json",
+            partial_json='{"path":"a.txt"}',
+            snapshot='{"path":"a.txt"}',
+        ),
+        SimpleNamespace(type="content_block_stop", index=1, content_block=tool_stop),
+    ]
+
+    events = await collect(
+        AnthropicProvider(ProviderConfig("DeepSeek", "anthropic", "key", "model"))
+    )
+
+    call = next(event.tool_call for event in events if event.type == "tool_call")
+    assert call.arguments == {"path": "a.txt"}
+
+
 async def test_anthropic_text_becomes_events():
     FakeClient.events = [
         SimpleNamespace(type="text", text="你"),
@@ -120,3 +151,29 @@ async def test_anthropic_text_becomes_events():
     events = await collect(AnthropicProvider(ProviderConfig("Claude", "anthropic", "key", "model")))
     assert [event.text for event in events if event.type == "text_delta"] == ["你", "好"]
     assert events[-1].message.content == "你好"
+
+
+async def test_anthropic_emits_stream_usage():
+    FakeClient.events = [
+        SimpleNamespace(
+            type="message_start",
+            message=SimpleNamespace(usage=SimpleNamespace(input_tokens=12)),
+        ),
+        SimpleNamespace(
+            type="message_delta",
+            usage=SimpleNamespace(output_tokens=5),
+        ),
+    ]
+    events = await collect(AnthropicProvider(ProviderConfig("Claude", "anthropic", "key", "model")))
+
+    usage_event = next(event for event in events if event.type == "usage")
+    assert usage_event.usage.input_tokens == 12
+    assert usage_event.usage.output_tokens == 5
+
+
+async def test_anthropic_allows_missing_usage():
+    events = await collect(AnthropicProvider(ProviderConfig("Claude", "anthropic", "key", "model")))
+
+    usage_event = next(event for event in events if event.type == "usage")
+    assert usage_event.usage.input_tokens is None
+    assert usage_event.usage.output_tokens is None

@@ -26,6 +26,15 @@ class ToolRegistry:
     def definitions(self) -> list[ToolDefinition]:
         return [tool.definition() for tool in self._tools.values()]
 
+    def subset(self, names: set[str]) -> "ToolRegistry":
+        """按原注册顺序返回共享工具实例的子注册中心。"""
+
+        registry = ToolRegistry()
+        for name, tool in self._tools.items():
+            if name in names:
+                registry.register(tool)
+        return registry
+
     async def execute(self, call: ToolCall) -> ToolResult:
         tool = self.get(call.name)
         if tool is None:

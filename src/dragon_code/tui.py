@@ -21,11 +21,18 @@ from textual.widgets import OptionList, RichLog, Static, TextArea
 from textual.worker import Worker
 
 from dragon_code import __version__
-from dragon_code.models import AppConfig, ProviderConfig, ToolCall, ToolResult
-from dragon_code.prompt import build_system_prompt, render_banner
+from dragon_code.agent import Agent
+from dragon_code.models import (
+    AppConfig,
+    ProviderConfig,
+    TokenUsage,
+    ToolCall,
+    ToolResult,
+)
+from dragon_code.prompt import DO_PLAN_PROMPT, build_system_prompt, render_banner
 from dragon_code.providers.base import BaseProvider, ProviderError
 from dragon_code.providers.factory import create_provider
-from dragon_code.session import ChatSession, Conversation
+from dragon_code.session import Conversation
 from dragon_code.tools import create_default_registry
 
 
@@ -160,6 +167,7 @@ class DragonCodeApp(App):
     CSS_PATH = "dragon_code.tcss"
     BINDINGS = [
         Binding("ctrl+c", "copy_or_quit", show=False, priority=True),
+        Binding("escape", "cancel_turn", show=False, priority=True),
     ]
 
     def __init__(
@@ -172,12 +180,17 @@ class DragonCodeApp(App):
         self.provider_factory = provider_factory
         self.session_state = SessionState.SELECTING
         self.provider: BaseProvider | None = None
-        self.session: ChatSession | None = None
+        self.agent: Agent | None = None
         self.reply_buffer = ""
         self.turn_start = 0.0
         self.timer: Timer | None = None
         self.stream_worker: Worker | None = None
         self.spinner_index = 0
+        self.current_iteration = 0
+        self.max_iterations = 0
+        self.task_usage = TokenUsage(0, 0)
+        self.session_usage = TokenUsage(0, 0)
+        self.task_usage_committed = False
 
     def compose(self) -> ComposeResult:
         yield Static(render_banner(__version__, os.getcwd()), id="banner")
@@ -195,6 +208,7 @@ class DragonCodeApp(App):
             )
         with Horizontal(id="statusbar"):
             yield Static("", id="provider-name")
+            yield Static("Token 0", id="token-usage")
             yield Static("", id="model-name")
 
     def on_mount(self) -> None:
@@ -220,7 +234,7 @@ class DragonCodeApp(App):
         config = self.config.providers[index]
         self.provider = self.provider_factory(config)
         workdir = Path.cwd()
-        self.session = ChatSession(
+        self.agent = Agent(
             self.provider,
             Conversation(),
             build_system_prompt(workdir),
@@ -244,13 +258,28 @@ class DragonCodeApp(App):
             self.action_safe_quit()
             return
 
+        command = text.strip()
+        if command == "/plan":
+            self._enter_plan_mode()
+            return
+        if command.startswith("/plan "):
+            task = command[len("/plan ") :].strip()
+            if task:
+                self._enter_plan_mode(show_notice=False)
+                self._start_turn(task, display_text=text)
+            return
+        if command == "/do":
+            self._execute_plan()
+            return
+
         self._start_turn(text)
 
-    def _start_turn(self, user_text: str) -> None:
+    def _start_turn(self, user_text: str, display_text: str | None = None) -> None:
         """更新界面状态并启动异步模型请求。"""
 
         conversation = self.query_one("#conversation", RichLog)
-        conversation.write(Text(f"❯ {user_text}", style="bold cyan"))
+        visible_text = display_text if display_text is not None else user_text
+        conversation.write(Text(f"❯ {visible_text}", style="bold cyan"))
 
         input_widget = self.query_one("#message-input", MessageInput)
         input_widget.load_text("")
@@ -259,6 +288,10 @@ class DragonCodeApp(App):
         self.reply_buffer = ""
         self.turn_start = time.monotonic()
         self.spinner_index = 0
+        self.current_iteration = 0
+        self.max_iterations = 0
+        self.task_usage = TokenUsage(0, 0)
+        self.task_usage_committed = False
         self.session_state = SessionState.STREAMING
         self.query_one("#streaming", Static).update("")
         self._update_timer()
@@ -271,36 +304,62 @@ class DragonCodeApp(App):
         )
 
     async def _consume_turn(self, user_text: str) -> None:
-        """消费 ChatSession 事件并实时更新界面。"""
+        """消费 Agent 事件并实时更新界面。"""
 
-        if self.session is None:
+        if self.agent is None:
             self._finish_with_error(ProviderError("unknown", "当前没有可用的 Provider。"))
             return
 
-        async for event in self.session.stream_turn(user_text):
-            if event.type == "text":
+        async for event in self.agent.run(user_text):
+            if event.type == "progress":
+                self.current_iteration = event.iteration
+                self.max_iterations = event.max_iterations
+                self._update_timer()
+            elif event.type == "text":
                 self.reply_buffer += event.text
                 self.query_one("#streaming", Static).update(self.reply_buffer)
-            elif event.type == "tool_call" and event.tool_call is not None:
+            elif event.type == "tool_start" and event.tool_call is not None:
                 self._flush_streaming_text()
                 line = Text(format_tool_call(event.tool_call), style="bold cyan")
                 self.query_one("#conversation", RichLog).write(line)
-            elif event.type == "tool_result" and event.tool_result is not None:
-                result = event.tool_result
-                style = "green" if result.success else "bold red"
-                prefix = "  └─ " if result.success else "  └─ 错误："
-                line = Text(prefix + format_tool_result(result), style=style)
-                self.query_one("#conversation", RichLog).write(line)
+            elif event.type == "tool_end" and event.tool_result is not None:
+                self._write_tool_result(event.tool_result)
+            elif event.type == "usage" and event.usage is not None:
+                self.task_usage = event.usage
+                self._update_usage_status(event.usage, task_in_progress=True)
             elif event.type == "completed":
-                self._finish_with_reply(event.text)
+                self._finish_with_reply(event.text, event.usage)
+            elif event.type == "cancelled":
+                self._finish_with_status(event.text, "bold yellow", event.usage)
             elif event.type == "limit":
-                self._finish_with_limit(event.text)
+                self._finish_with_status(event.text, "bold yellow", event.usage)
             elif event.type == "error":
                 error = event.error
                 if isinstance(error, ProviderError):
-                    self._finish_with_error(error)
+                    self._finish_with_error(error, event.usage)
                 else:
-                    self._finish_with_error(ProviderError("unknown", "模型请求失败，请稍后再试。"))
+                    self._finish_with_error(
+                        ProviderError("unknown", "模型请求失败，请稍后再试。"),
+                        event.usage,
+                    )
+
+    def _write_tool_result(self, result: ToolResult) -> None:
+        """按结果类型显示成功、错误、取消或状态未知。"""
+
+        if result.success:
+            style = "green"
+            prefix = "  └─ "
+        elif result.error_code == "cancelled":
+            style = "bold yellow"
+            prefix = "  └─ 已取消："
+        elif result.error_code == "cancel_outcome_unknown":
+            style = "bold yellow"
+            prefix = "  └─ 状态未知："
+        else:
+            style = "bold red"
+            prefix = "  └─ 错误："
+        line = Text(prefix + format_tool_result(result), style=style)
+        self.query_one("#conversation", RichLog).write(line)
 
     def _flush_streaming_text(self) -> None:
         """把工具调用前的模型文字固定到历史区。"""
@@ -321,7 +380,10 @@ class DragonCodeApp(App):
         frame = frames[self.spinner_index % len(frames)]
         self.spinner_index += 1
         elapsed = int(time.monotonic() - self.turn_start)
-        self.query_one("#timer", Static).update(f"{frame} Imagining… ({elapsed}s)")
+        progress = ""
+        if self.current_iteration:
+            progress = f" · 第 {self.current_iteration}/{self.max_iterations} 轮"
+        self.query_one("#timer", Static).update(f"{frame} Imagining…{progress} ({elapsed}s)")
 
     def _stop_turn(self) -> float:
         """停止计时并恢复输入，返回本轮总耗时。"""
@@ -341,29 +403,102 @@ class DragonCodeApp(App):
         input_widget.focus()
         return elapsed
 
-    def _finish_with_reply(self, reply: str) -> None:
+    def _finish_with_reply(self, reply: str, usage: TokenUsage | None = None) -> None:
         """把完整回复定型为 Markdown 并写入历史区。"""
 
+        self._commit_task_usage(usage)
         elapsed = self._stop_turn()
         rendered = Group(
             Markdown(reply),
-            Text(f"完成 · {elapsed:.1f}s", style="dim"),
+            Text(
+                f"完成 · {elapsed:.1f}s · {self._format_usage(self.task_usage)}",
+                style="dim",
+            ),
         )
         self.query_one("#conversation", RichLog).write(rendered)
 
-    def _finish_with_error(self, error: ProviderError) -> None:
+    def _finish_with_error(
+        self,
+        error: ProviderError,
+        usage: TokenUsage | None = None,
+    ) -> None:
         """显示脱敏错误并允许用户继续对话。"""
 
+        self._flush_streaming_text()
+        self._commit_task_usage(usage)
         self._stop_turn()
         message = Text(f"● {error.message}", style="bold red")
         self.query_one("#conversation", RichLog).write(message)
 
-    def _finish_with_limit(self, message: str) -> None:
-        """显示单轮工具上限，并恢复输入状态。"""
+    def _finish_with_status(
+        self,
+        message: str,
+        style: str,
+        usage: TokenUsage | None = None,
+    ) -> None:
+        """显示取消或安全上限提示，并恢复输入状态。"""
 
         self._flush_streaming_text()
+        self._commit_task_usage(usage)
         self._stop_turn()
-        self.query_one("#conversation", RichLog).write(Text(f"● {message}", style="bold yellow"))
+        self.query_one("#conversation", RichLog).write(Text(f"● {message}", style=style))
+
+    def _commit_task_usage(self, usage: TokenUsage | None) -> None:
+        """一个任务只向会话累计一次 Token 用量。"""
+
+        if usage is not None:
+            self.task_usage = usage
+        if not self.task_usage_committed:
+            self.session_usage = self.session_usage.add(self.task_usage)
+            self.task_usage_committed = True
+        self._update_usage_status(self.session_usage)
+
+    def _update_usage_status(
+        self,
+        usage: TokenUsage,
+        *,
+        task_in_progress: bool = False,
+    ) -> None:
+        prefix = "本轮" if task_in_progress else "会话"
+        self.query_one("#token-usage", Static).update(f"{prefix} {self._format_usage(usage)}")
+
+    @staticmethod
+    def _format_usage(usage: TokenUsage) -> str:
+        if usage.input_tokens is None or usage.output_tokens is None:
+            return "Token 用量未知"
+        return (
+            f"Token {usage.total_tokens} (输入 {usage.input_tokens} / 输出 {usage.output_tokens})"
+        )
+
+    def _enter_plan_mode(self, *, show_notice: bool = True) -> None:
+        """进入持续只读的 Plan Mode。"""
+
+        if self.agent is None:
+            return
+        self.agent.enter_plan_mode()
+        self.query_one("#ready", Static).update("● Plan Mode：仅使用只读工具")
+        self._clear_input()
+        if show_notice:
+            self.query_one("#conversation", RichLog).write(
+                Text("● 已进入 Plan Mode。输入任务开始规划，输入 /do 执行计划。", style="cyan")
+            )
+
+    def _execute_plan(self) -> None:
+        """离开 Plan Mode，并让 Agent 立即执行已经完成的计划。"""
+
+        if self.agent is None or not self.agent.can_execute_plan():
+            self._clear_input()
+            self.query_one("#conversation", RichLog).write(
+                Text("● 当前没有可执行的计划，请先使用 /plan 完成规划。", style="bold yellow")
+            )
+            return
+
+        self.agent.enter_default_mode()
+        self.query_one("#ready", Static).update("● 对话服务已就绪")
+        self._start_turn(DO_PLAN_PROMPT, display_text="/do")
+
+    def _clear_input(self) -> None:
+        self.query_one("#message-input", MessageInput).load_text("")
 
     def action_safe_quit(self) -> None:
         """清理计时器和 Worker 后退出。"""
@@ -371,10 +506,18 @@ class DragonCodeApp(App):
         if self.timer is not None:
             self.timer.stop()
             self.timer = None
+        if self.agent is not None:
+            self.agent.request_cancel()
         if self.stream_worker is not None:
             self.stream_worker.cancel()
             self.stream_worker = None
         self.exit()
+
+    def action_cancel_turn(self) -> None:
+        """Esc 只取消正在运行的 Agent，不退出应用。"""
+
+        if self.session_state is SessionState.STREAMING and self.agent is not None:
+            self.agent.request_cancel()
 
     def action_copy_or_quit(self) -> None:
         """有选中文字时复制，否则沿用 Ctrl+C 安全退出。"""
@@ -382,6 +525,10 @@ class DragonCodeApp(App):
         selected_text = self.screen.get_selected_text()
         if selected_text:
             self.copy_to_clipboard(selected_text)
+            return
+
+        if self.session_state is SessionState.STREAMING:
+            self.action_cancel_turn()
             return
 
         self.action_safe_quit()

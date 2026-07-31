@@ -2,7 +2,14 @@
 
 from rich.text import Text
 
-from dragon_code.prompt import DRAGON_BANNER, build_system_prompt, render_banner
+from dragon_code.prompt import (
+    DO_PLAN_PROMPT,
+    DRAGON_BANNER,
+    PLAN_MODE_PROMPT,
+    build_agent_prompt,
+    build_system_prompt,
+    render_banner,
+)
 
 
 def test_dragon_banner_matches_approved_icon():
@@ -60,5 +67,18 @@ def test_system_prompt_contains_agent_rules(tmp_path):
     assert "Dragon Code" in prompt
     assert str(tmp_path.resolve()) in prompt
     assert "Read、Write、Edit、Bash、Glob、Grep" in prompt
-    assert "只执行一轮工具" in prompt
+    assert "继续调用工具" in prompt
+    assert "只执行一轮工具" not in prompt
     assert "仅支持文本对话" not in prompt
+
+
+def test_agent_prompt_adds_plan_rules_only_in_plan_mode():
+    base = "基础提示"
+
+    assert build_agent_prompt(base, "default") == base
+    plan_prompt = build_agent_prompt(base, "plan")
+    assert base in plan_prompt
+    assert PLAN_MODE_PROMPT in plan_prompt
+    assert "Read、Glob、Grep" in plan_prompt
+    assert "/do" in plan_prompt
+    assert "根据上文" in DO_PLAN_PROMPT

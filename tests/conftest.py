@@ -13,6 +13,7 @@ class FakeProvider(BaseProvider):
         self,
         chunks: list[str] | None = None,
         events: list[ProviderEvent] | None = None,
+        responses: list[list[ProviderEvent] | ProviderError] | None = None,
         error: ProviderError | None = None,
         delay: float = 0,
     ):
@@ -20,19 +21,35 @@ class FakeProvider(BaseProvider):
         super().__init__(config)
         self.chunks = chunks or []
         self.events = events
+        self.responses = list(responses or [])
         self.error = error
         self.delay = delay
         self.received_messages = []
         self.received_system_prompt = ""
         self.received_tools = []
+        self.requests = []
 
     async def stream(self, messages, system_prompt, tools):
         self.received_messages = list(messages)
         self.received_system_prompt = system_prompt
         self.received_tools = list(tools)
+        self.requests.append(
+            {
+                "messages": list(messages),
+                "system_prompt": system_prompt,
+                "tools": list(tools),
+            }
+        )
 
         if self.error:
             raise self.error
+        if self.responses:
+            response = self.responses.pop(0)
+            if isinstance(response, ProviderError):
+                raise response
+            for event in response:
+                yield event
+            return
         if self.events is not None:
             for event in self.events:
                 yield event

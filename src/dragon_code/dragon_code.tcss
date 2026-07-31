@@ -74,6 +74,11 @@ Screen {
     width: 1fr;
 }
 
+#token-usage {
+    width: auto;
+    margin: 0 2;
+}
+
 #model-name {
     width: auto;
     text-align: right;

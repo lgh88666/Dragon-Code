@@ -89,21 +89,54 @@ class ChatMessage:
 
 
 @dataclass
+class TokenUsage:
+    """一次模型请求或一个 Agent 任务的 Token 用量。"""
+
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+
+    def add(self, other: "TokenUsage") -> "TokenUsage":
+        """合并用量；只要其中一方未知，累计值也保持未知。"""
+
+        input_tokens = None
+        if self.input_tokens is not None and other.input_tokens is not None:
+            input_tokens = self.input_tokens + other.input_tokens
+
+        output_tokens = None
+        if self.output_tokens is not None and other.output_tokens is not None:
+            output_tokens = self.output_tokens + other.output_tokens
+
+        return TokenUsage(input_tokens=input_tokens, output_tokens=output_tokens)
+
+    @property
+    def total_tokens(self) -> int | None:
+        """输入和输出都已知时返回总数。"""
+
+        if self.input_tokens is None or self.output_tokens is None:
+            return None
+        return self.input_tokens + self.output_tokens
+
+
+@dataclass
 class ProviderEvent:
-    """Provider 发送给 ChatSession 的统一流式事件。"""
+    """Provider 发送给 Agent 的统一流式事件。"""
 
     type: str
     text: str = ""
     tool_call: ToolCall | None = None
     message: ChatMessage | None = None
+    usage: TokenUsage | None = None
 
 
 @dataclass
-class TurnEvent:
-    """ChatSession 发送给 TUI 的事件。"""
+class AgentEvent:
+    """Agent 发送给 TUI 的协议无关事件。"""
 
     type: str
     text: str = ""
     tool_call: ToolCall | None = None
     tool_result: ToolResult | None = None
+    usage: TokenUsage | None = None
+    iteration: int = 0
+    max_iterations: int = 0
     error: Exception | None = None

@@ -9,6 +9,7 @@ from dragon_code.models import (
     ChatMessage,
     ProviderConfig,
     ProviderEvent,
+    TokenUsage,
     ToolCall,
     ToolDefinition,
 )
@@ -80,16 +81,25 @@ class OpenAIProvider(BaseProvider):
     ):
         """通过 Chat Completions 流式产出统一事件。"""
 
+        response = None
         try:
             response = await self._client.chat.completions.create(
                 model=self.model,
                 messages=self._build_messages(messages, system_prompt),
                 tools=self._build_tools(tools),
                 stream=True,
+                stream_options={"include_usage": True},
             )
             reply_parts: list[str] = []
             buffers: dict[int, dict[str, str]] = {}
+            usage = TokenUsage()
             async for chunk in response:
+                chunk_usage = getattr(chunk, "usage", None)
+                if chunk_usage is not None:
+                    usage = TokenUsage(
+                        input_tokens=getattr(chunk_usage, "prompt_tokens", None),
+                        output_tokens=getattr(chunk_usage, "completion_tokens", None),
+                    )
                 if not chunk.choices:
                     continue
                 delta = chunk.choices[0].delta
@@ -137,8 +147,14 @@ class OpenAIProvider(BaseProvider):
                 content="".join(reply_parts),
                 tool_calls=calls,
             )
+            yield ProviderEvent(type="usage", usage=usage)
             yield ProviderEvent(type="completed", message=message)
         except asyncio.CancelledError:
             raise
         except Exception as error:
             raise make_provider_error(error) from error
+        finally:
+            if response is not None:
+                close = getattr(response, "close", None)
+                if close is not None:
+                    await close()

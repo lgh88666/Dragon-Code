@@ -39,7 +39,7 @@ class BaseProvider:
         system_prompt: str,
         tools: list[ToolDefinition],
     ):
-        """流式返回统一 ProviderEvent，由子类实现。"""
+        """流式返回正文、工具调用、Token 用量和完整消息事件。"""
 
         raise NotImplementedError
         yield ProviderEvent(type="completed")  # pragma: no cover

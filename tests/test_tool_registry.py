@@ -15,6 +15,15 @@ def test_default_registry_has_six_tools_and_metadata(tmp_path):
     assert definitions[1].destructive is True
 
 
+def test_registry_subset_keeps_order_and_instances(tmp_path):
+    registry = create_default_registry(tmp_path)
+    subset = registry.subset({"Read", "Glob", "Grep"})
+
+    assert [item.name for item in subset.definitions()] == ["Read", "Glob", "Grep"]
+    assert subset.get("Read") is registry.get("Read")
+    assert subset.get("Write") is None
+
+
 def test_duplicate_registration_is_rejected(tmp_path):
     registry = ToolRegistry()
     registry.register(ReadTool(tmp_path))
