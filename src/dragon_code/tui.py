@@ -22,6 +22,8 @@ from textual.worker import Worker
 
 from dragon_code import __version__
 from dragon_code.agent import Agent
+from dragon_code.clients.base import LLMClient, LLMError
+from dragon_code.clients.factory import create_llm_client
 from dragon_code.models import (
     AppConfig,
     ProviderConfig,
@@ -29,9 +31,11 @@ from dragon_code.models import (
     ToolCall,
     ToolResult,
 )
-from dragon_code.prompt import DO_PLAN_PROMPT, build_system_prompt, render_banner
-from dragon_code.providers.base import BaseProvider, ProviderError
-from dragon_code.providers.factory import create_provider
+from dragon_code.permissions import ApprovalChoice, PermissionMode, PermissionRequest
+from dragon_code.permissions.approval import ApprovalController
+from dragon_code.permissions.engine import PermissionEngine
+from dragon_code.permissions.rules import RuleStore
+from dragon_code.prompt import DO_PLAN_PROMPT, render_banner
 from dragon_code.session import Conversation
 from dragon_code.tools import create_default_registry
 
@@ -77,6 +81,7 @@ class SessionState(Enum):
     SELECTING = "selecting"
     IDLE = "idle"
     STREAMING = "streaming"
+    APPROVING = "approving"
 
 
 class ConversationLog(RichLog):
@@ -160,26 +165,94 @@ class ProviderSelectScreen(ModalScreen[int]):
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         self.dismiss(event.option_index)
 
+    def submit_highlighted(self) -> None:
+        options = self.query_one("#provider-options", OptionList)
+        self.dismiss(options.highlighted or 0)
+
+
+class PermissionApprovalScreen(ModalScreen[ApprovalChoice | None]):
+    """显示一次工具调用的三选一权限确认。"""
+
+    BINDINGS = [
+        Binding("1", "allow_once", show=False, priority=True),
+        Binding("2", "allow_always", show=False, priority=True),
+        Binding("3", "deny_once", show=False, priority=True),
+        Binding("escape", "cancel", show=False, priority=True),
+        Binding("ctrl+c", "cancel", show=False, priority=True),
+    ]
+
+    def __init__(self, request: PermissionRequest):
+        super().__init__()
+        self.request = request
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="permission-dialog"):
+            yield Static("需要你的允许", id="permission-title")
+            yield Static(self.request.summary, id="permission-summary")
+            yield Static(self.request.reason, id="permission-reason")
+            yield OptionList(
+                "1. 允许本次",
+                "2. 永久允许此精确调用",
+                "3. 拒绝本次",
+                id="permission-options",
+            )
+
+    def on_mount(self) -> None:
+        options = self.query_one("#permission-options", OptionList)
+        options.highlighted = 0
+        options.focus()
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        choices = [
+            ApprovalChoice.ALLOW_ONCE,
+            ApprovalChoice.ALLOW_ALWAYS,
+            ApprovalChoice.DENY_ONCE,
+        ]
+        self.dismiss(choices[event.option_index])
+
+    def action_allow_once(self) -> None:
+        self.dismiss(ApprovalChoice.ALLOW_ONCE)
+
+    def action_allow_always(self) -> None:
+        self.dismiss(ApprovalChoice.ALLOW_ALWAYS)
+
+    def action_deny_once(self) -> None:
+        self.dismiss(ApprovalChoice.DENY_ONCE)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def submit_highlighted(self) -> None:
+        options = self.query_one("#permission-options", OptionList)
+        choices = [
+            ApprovalChoice.ALLOW_ONCE,
+            ApprovalChoice.ALLOW_ALWAYS,
+            ApprovalChoice.DENY_ONCE,
+        ]
+        self.dismiss(choices[options.highlighted or 0])
+
 
 class DragonCodeApp(App):
     """Dragon Code 主界面。"""
 
     CSS_PATH = "dragon_code.tcss"
     BINDINGS = [
+        Binding("enter", "submit_current_input", show=False, priority=True),
         Binding("ctrl+c", "copy_or_quit", show=False, priority=True),
         Binding("escape", "cancel_turn", show=False, priority=True),
+        Binding("shift+tab", "cycle_permission_mode", show=False, priority=True),
     ]
 
     def __init__(
         self,
         config: AppConfig,
-        provider_factory: Callable[[ProviderConfig], BaseProvider] = create_provider,
+        client_factory: Callable[[ProviderConfig], LLMClient] = create_llm_client,
     ):
         super().__init__()
         self.config = config
-        self.provider_factory = provider_factory
+        self.client_factory = client_factory
         self.session_state = SessionState.SELECTING
-        self.provider: BaseProvider | None = None
+        self.client: LLMClient | None = None
         self.agent: Agent | None = None
         self.reply_buffer = ""
         self.turn_start = 0.0
@@ -191,6 +264,7 @@ class DragonCodeApp(App):
         self.task_usage = TokenUsage(0, 0)
         self.session_usage = TokenUsage(0, 0)
         self.task_usage_committed = False
+        self.pending_permission_call_id = ""
 
     def compose(self) -> ComposeResult:
         yield Static(render_banner(__version__, os.getcwd()), id="banner")
@@ -232,17 +306,22 @@ class DragonCodeApp(App):
 
     def _activate_provider(self, index: int) -> None:
         config = self.config.providers[index]
-        self.provider = self.provider_factory(config)
+        self.client = self.client_factory(config)
         workdir = Path.cwd()
+        rule_store = RuleStore.load(workdir)
         self.agent = Agent(
-            self.provider,
+            self.client,
             Conversation(),
-            build_system_prompt(workdir),
             create_default_registry(workdir),
+            workdir,
+            __version__,
+            permission_engine=PermissionEngine(workdir, rule_store),
+            approval_controller=ApprovalController(),
+            permission_mode=rule_store.default_mode(),
         )
         self.session_state = SessionState.IDLE
-        self.query_one("#provider-name", Static).update(self.provider.name)
-        self.query_one("#model-name", Static).update(self.provider.model)
+        self._update_permission_mode_display()
+        self.query_one("#model-name", Static).update(self.client.model)
         self.query_one("#message-input", MessageInput).focus()
 
     def on_message_input_submitted(self, event: MessageInput.Submitted) -> None:
@@ -256,6 +335,9 @@ class DragonCodeApp(App):
             return
         if text.strip() == "/exit":
             self.action_safe_quit()
+            return
+        if text.strip() == "/help":
+            self._show_help()
             return
 
         command = text.strip()
@@ -307,7 +389,7 @@ class DragonCodeApp(App):
         """消费 Agent 事件并实时更新界面。"""
 
         if self.agent is None:
-            self._finish_with_error(ProviderError("unknown", "当前没有可用的 Provider。"))
+            self._finish_with_error(LLMError("unknown", "当前没有可用的 Provider。"))
             return
 
         async for event in self.agent.run(user_text):
@@ -324,6 +406,12 @@ class DragonCodeApp(App):
                 self.query_one("#conversation", RichLog).write(line)
             elif event.type == "tool_end" and event.tool_result is not None:
                 self._write_tool_result(event.tool_result)
+            elif event.type == "permission_request" and event.permission_request is not None:
+                self._show_permission_request(event.permission_request)
+            elif event.type == "permission_warning":
+                self.query_one("#conversation", RichLog).write(
+                    Text(f"● {event.text}", style="bold yellow")
+                )
             elif event.type == "usage" and event.usage is not None:
                 self.task_usage = event.usage
                 self._update_usage_status(event.usage, task_in_progress=True)
@@ -335,11 +423,11 @@ class DragonCodeApp(App):
                 self._finish_with_status(event.text, "bold yellow", event.usage)
             elif event.type == "error":
                 error = event.error
-                if isinstance(error, ProviderError):
+                if isinstance(error, LLMError):
                     self._finish_with_error(error, event.usage)
                 else:
                     self._finish_with_error(
-                        ProviderError("unknown", "模型请求失败，请稍后再试。"),
+                        LLMError("unknown", "模型请求失败，请稍后再试。"),
                         event.usage,
                     )
 
@@ -373,7 +461,7 @@ class DragonCodeApp(App):
     def _update_timer(self) -> None:
         """刷新等待动画和已用秒数。"""
 
-        if self.session_state is not SessionState.STREAMING:
+        if self.session_state not in {SessionState.STREAMING, SessionState.APPROVING}:
             return
 
         frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
@@ -401,6 +489,8 @@ class DragonCodeApp(App):
         input_widget = self.query_one("#message-input", MessageInput)
         input_widget.disabled = False
         input_widget.focus()
+        # 权限 Modal 可能也在本轮刷新中关闭；下一次刷新后再聚焦，避免焦点被弹窗覆盖。
+        self.call_after_refresh(input_widget.focus)
         return elapsed
 
     def _finish_with_reply(self, reply: str, usage: TokenUsage | None = None) -> None:
@@ -419,7 +509,7 @@ class DragonCodeApp(App):
 
     def _finish_with_error(
         self,
-        error: ProviderError,
+        error: LLMError,
         usage: TokenUsage | None = None,
     ) -> None:
         """显示脱敏错误并允许用户继续对话。"""
@@ -476,7 +566,7 @@ class DragonCodeApp(App):
         if self.agent is None:
             return
         self.agent.enter_plan_mode()
-        self.query_one("#ready", Static).update("● Plan Mode：仅使用只读工具")
+        self._update_permission_mode_display()
         self._clear_input()
         if show_notice:
             self.query_one("#conversation", RichLog).write(
@@ -494,11 +584,117 @@ class DragonCodeApp(App):
             return
 
         self.agent.enter_default_mode()
-        self.query_one("#ready", Static).update("● 对话服务已就绪")
+        self._update_permission_mode_display()
         self._start_turn(DO_PLAN_PROMPT, display_text="/do")
+
+    def _show_permission_request(self, request: PermissionRequest) -> None:
+        """打开权限确认框，Agent 会等待回调结果。"""
+
+        self.session_state = SessionState.APPROVING
+        self.pending_permission_call_id = request.call.id
+        self.push_screen(
+            PermissionApprovalScreen(request),
+            callback=self._permission_selected,
+        )
+
+    def _permission_selected(self, choice: ApprovalChoice | None) -> None:
+        """把确认框选择交还 Agent，取消则停止当前任务。"""
+
+        if self.agent is None:
+            return
+        call_id = self.pending_permission_call_id
+        self.pending_permission_call_id = ""
+        self.session_state = SessionState.STREAMING
+        if choice is None:
+            self.agent.request_cancel()
+            return
+        self.agent.resolve_permission(call_id, choice)
+
+    def action_cycle_permission_mode(self) -> None:
+        """空闲时按 Shift+Tab 循环切换四种权限模式。"""
+
+        if self.session_state is not SessionState.IDLE or self.agent is None:
+            return
+        self.agent.cycle_permission_mode()
+        self._update_permission_mode_display()
+
+    def action_submit_current_input(self) -> None:
+        """按会话状态处理 Enter，不依赖焦点是否从 Modal 正确返回。"""
+
+        if self.session_state is SessionState.SELECTING and isinstance(
+            self.screen, ProviderSelectScreen
+        ):
+            self.screen.submit_highlighted()
+            return
+        if self.session_state is SessionState.APPROVING and isinstance(
+            self.screen, PermissionApprovalScreen
+        ):
+            self.screen.submit_highlighted()
+            return
+        if self.session_state is not SessionState.IDLE:
+            return
+        input_widget = self.query_one("#message-input", MessageInput)
+        self.on_message_input_submitted(MessageInput.Submitted(input_widget.text))
+
+    def _update_permission_mode_display(self) -> None:
+        """让状态栏和就绪提示始终使用 Agent 的唯一模式状态。"""
+
+        if self.agent is None:
+            return
+        mode = self.agent.mode
+        self.query_one("#provider-name", Static).update(mode.value)
+        messages = {
+            PermissionMode.DEFAULT: "● Default：写文件和命令需要确认",
+            PermissionMode.ACCEPT_EDITS: "● Accept Edits：文件修改自动允许",
+            PermissionMode.PLAN: "● Plan Mode：仅使用只读工具",
+            PermissionMode.BYPASS_PERMISSIONS: "● Bypass：日常操作自动允许，硬防线仍生效",
+        }
+        self.query_one("#ready", Static).update(messages[mode])
 
     def _clear_input(self) -> None:
         self.query_one("#message-input", MessageInput).load_text("")
+
+    def _show_help(self) -> None:
+        """在对话区显示命令和快捷键帮助，清空输入框。"""
+        self._clear_input()
+        help_text = Text.assemble(
+            ("Dragon Code 帮助\n", "bold white"),
+            ("\n命令：\n", "bold cyan"),
+            ("  /help           ", "cyan"),
+            ("显示本帮助\n", "dim"),
+            ("  /exit           ", "cyan"),
+            ("退出程序\n", "dim"),
+            ("  /plan           ", "cyan"),
+            ("进入只读 Plan Mode\n", "dim"),
+            ("  /plan <任务>    ", "cyan"),
+            ("Plan Mode 中规划任务\n", "dim"),
+            ("  /do             ", "cyan"),
+            ("执行已确认的计划\n", "dim"),
+            ("\n快捷键：\n", "bold cyan"),
+            ("  Enter           ", "cyan"),
+            ("提交消息\n", "dim"),
+            ("  Alt+Enter       ", "cyan"),
+            ("输入框中换行\n", "dim"),
+            ("  Ctrl+C          ", "cyan"),
+            ("复制选中文字 / 取消当前任务 / 空闲时退出\n", "dim"),
+            ("  Esc             ", "cyan"),
+            ("取消正在运行的 Agent 任务\n", "dim"),
+            ("  Shift+Tab       ", "cyan"),
+            ("切换 default / acceptEdits / plan / bypassPermissions\n", "dim"),
+            ("\n权限确认：\n", "bold cyan"),
+            ("  1               ", "cyan"),
+            ("允许本次\n", "dim"),
+            ("  2               ", "cyan"),
+            ("永久允许此精确调用\n", "dim"),
+            ("  3               ", "cyan"),
+            ("拒绝本次\n", "dim"),
+            ("\n工具（Default Mode）：\n", "bold cyan"),
+            ("  Read Write Edit Bash Glob Grep\n", "dim"),
+            ("\n工具（Plan Mode）：\n", "bold cyan"),
+            ("  Read Glob Grep\n", "dim"),
+            ("\n更多：README.md · specs/\n", "dim"),
+        )
+        self.query_one("#conversation", RichLog).write(help_text)
 
     def action_safe_quit(self) -> None:
         """清理计时器和 Worker 后退出。"""
@@ -516,7 +712,14 @@ class DragonCodeApp(App):
     def action_cancel_turn(self) -> None:
         """Esc 只取消正在运行的 Agent，不退出应用。"""
 
-        if self.session_state is SessionState.STREAMING and self.agent is not None:
+        if (
+            self.session_state
+            in {
+                SessionState.STREAMING,
+                SessionState.APPROVING,
+            }
+            and self.agent is not None
+        ):
             self.agent.request_cancel()
 
     def action_copy_or_quit(self) -> None:
@@ -527,7 +730,7 @@ class DragonCodeApp(App):
             self.copy_to_clipboard(selected_text)
             return
 
-        if self.session_state is SessionState.STREAMING:
+        if self.session_state in {SessionState.STREAMING, SessionState.APPROVING}:
             self.action_cancel_turn()
             return
 

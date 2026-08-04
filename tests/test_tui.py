@@ -3,27 +3,29 @@
 import asyncio
 from pathlib import Path
 
-from conftest import FakeProvider
+from conftest import FakeClient
 from rich.markdown import Markdown
 from rich.text import Text
 from textual.color import Color
 from textual.events import MouseMove
 from textual.widgets import OptionList, RichLog, Static
 
+from dragon_code.clients.base import LLMError
 from dragon_code.models import (
     AppConfig,
     ChatMessage,
+    LLMEvent,
     ProviderConfig,
-    ProviderEvent,
     TokenUsage,
     ToolCall,
     ToolResult,
 )
+from dragon_code.permissions import ApprovalChoice, PermissionMode, PermissionRequest
 from dragon_code.prompt import DO_PLAN_PROMPT
-from dragon_code.providers.base import ProviderError
 from dragon_code.tui import (
     DragonCodeApp,
     MessageInput,
+    PermissionApprovalScreen,
     SessionState,
     format_tool_call,
     format_tool_result,
@@ -34,9 +36,9 @@ def provider_config(name: str = "Fake", model: str = "fake-model") -> ProviderCo
     return ProviderConfig(name, "openai", "fake-key", model)
 
 
-def app_with_provider(fake_provider: FakeProvider) -> DragonCodeApp:
-    config = AppConfig([provider_config(fake_provider.name, fake_provider.model)])
-    return DragonCodeApp(config, provider_factory=lambda _config: fake_provider)
+def app_with_client(fake_client: FakeClient) -> DragonCodeApp:
+    config = AppConfig([provider_config(fake_client.name, fake_client.model)])
+    return DragonCodeApp(config, client_factory=lambda _config: fake_client)
 
 
 def complete_response(
@@ -44,15 +46,15 @@ def complete_response(
     *,
     calls: list[ToolCall] | None = None,
     usage: tuple[int, int] = (10, 2),
-) -> list[ProviderEvent]:
-    """生成一轮完整的 FakeProvider 响应。"""
+) -> list[LLMEvent]:
+    """生成一轮完整的 FakeClient 响应。"""
 
     calls = calls or []
-    events = [ProviderEvent("tool_call", tool_call=call) for call in calls]
+    events = [LLMEvent("tool_call", tool_call=call) for call in calls]
     events.extend(
         [
-            ProviderEvent("usage", usage=TokenUsage(*usage)),
-            ProviderEvent(
+            LLMEvent("usage", usage=TokenUsage(*usage)),
+            LLMEvent(
                 "completed",
                 message=ChatMessage("assistant", content, tool_calls=calls),
             ),
@@ -69,8 +71,16 @@ async def wait_until_idle(app: DragonCodeApp, pilot, attempts: int = 30):
     raise AssertionError("应用未在预期时间内恢复 IDLE")
 
 
+async def wait_until_state(app: DragonCodeApp, pilot, state: SessionState, attempts: int = 30):
+    for _ in range(attempts):
+        if app.session_state is state:
+            return
+        await pilot.pause(0.02)
+    raise AssertionError(f"应用未在预期时间内进入 {state.value}")
+
+
 async def test_single_provider_layout():
-    app = app_with_provider(FakeProvider())
+    app = app_with_client(FakeClient())
 
     async with app.run_test(size=(90, 30)) as pilot:
         await pilot.pause()
@@ -82,7 +92,7 @@ async def test_single_provider_layout():
         assert "Dragon Code" in banner_text
         assert "Multi-provider coding agent" in banner_text
         assert banner.styles.color == Color.parse("white")
-        assert str(app.query_one("#provider-name", Static).render()) == "Fake"
+        assert str(app.query_one("#provider-name", Static).render()) == "default"
         assert str(app.query_one("#model-name", Static).render()) == "fake-model"
         assert app.query_one("#message-input", MessageInput).has_focus
 
@@ -91,9 +101,9 @@ async def test_multiple_provider_selection():
     configs = [provider_config("One", "model-one"), provider_config("Two", "model-two")]
 
     def factory(config):
-        return FakeProvider(chunks=[config.name])
+        return FakeClient(chunks=[config.name])
 
-    app = DragonCodeApp(AppConfig(configs), provider_factory=factory)
+    app = DragonCodeApp(AppConfig(configs), client_factory=factory)
 
     async with app.run_test(size=(90, 30)) as pilot:
         await pilot.pause()
@@ -103,14 +113,14 @@ async def test_multiple_provider_selection():
         await pilot.pause()
 
         assert app.session_state is SessionState.IDLE
-        assert str(app.query_one("#provider-name", Static).render()) == "Fake"
-        assert app.provider is not None
-        assert app.provider.chunks == ["Two"]
+        assert str(app.query_one("#provider-name", Static).render()) == "default"
+        assert app.client is not None
+        assert app.client.chunks == ["Two"]
 
 
 async def test_alt_enter_inserts_newline_and_enter_submits():
-    provider = FakeProvider(chunks=["收到"])
-    app = app_with_provider(provider)
+    client = FakeClient(chunks=["收到"])
+    app = app_with_client(client)
 
     async with app.run_test(size=(90, 30)) as pilot:
         input_widget = app.query_one("#message-input", MessageInput)
@@ -122,13 +132,13 @@ async def test_alt_enter_inserts_newline_and_enter_submits():
         await pilot.press("enter")
         await wait_until_idle(app, pilot)
 
-        assert provider.received_messages[-1].content == "第一行\n第二行"
+        assert client.received_messages[-1].content == "第一行\n第二行"
         assert input_widget.text == ""
 
 
 async def test_streaming_completion_and_markdown():
-    provider = FakeProvider(chunks=["**你", "好**"], delay=0.1)
-    app = app_with_provider(provider)
+    client = FakeClient(chunks=["**你", "好**"], delay=0.1)
+    app = app_with_client(client)
 
     async with app.run_test(size=(90, 30)) as pilot:
         app.query_one("#message-input", MessageInput).load_text("问候")
@@ -145,13 +155,13 @@ async def test_streaming_completion_and_markdown():
 
 
 async def test_progress_and_token_usage_are_visible():
-    provider = FakeProvider(
+    client = FakeClient(
         responses=[
             complete_response("第一答", usage=(10, 3)),
             complete_response("第二答", usage=(5, 2)),
         ]
     )
-    app = app_with_provider(provider)
+    app = app_with_client(client)
 
     async with app.run_test(size=(100, 30)) as pilot:
         input_widget = app.query_one("#message-input", MessageInput)
@@ -176,13 +186,13 @@ async def test_progress_and_token_usage_are_visible():
 
 async def test_tool_events_render_in_scrollback_in_order():
     call = ToolCall("read-1", "Read", {"path": "pyproject.toml"})
-    provider = FakeProvider(
+    client = FakeClient(
         responses=[
             complete_response("先读取", calls=[call]),
             complete_response("读取完成"),
         ]
     )
-    app = app_with_provider(provider)
+    app = app_with_client(client)
 
     async with app.run_test(size=(100, 30)) as pilot:
         app.query_one("#message-input", MessageInput).load_text("读取配置")
@@ -197,7 +207,7 @@ async def test_tool_events_render_in_scrollback_in_order():
 
 
 async def test_tool_result_states_have_distinct_labels():
-    app = app_with_provider(FakeProvider())
+    app = app_with_client(FakeClient())
 
     async with app.run_test(size=(100, 30)) as pilot:
         app._write_tool_result(ToolResult("1", "Read", True, content="成功"))
@@ -240,13 +250,13 @@ async def test_tool_result_states_have_distinct_labels():
 
 
 async def test_plan_mode_and_do_command():
-    provider = FakeProvider(
+    client = FakeClient(
         responses=[
             complete_response("计划：先读取，再修改"),
             complete_response("已经按计划完成"),
         ]
     )
-    app = app_with_provider(provider)
+    app = app_with_client(client)
 
     async with app.run_test(size=(100, 30)) as pilot:
         input_widget = app.query_one("#message-input", MessageInput)
@@ -256,7 +266,7 @@ async def test_plan_mode_and_do_command():
 
         assert app.agent is not None
         assert app.agent.mode == "plan"
-        assert len(provider.requests) == 0
+        assert len(client.requests) == 0
         assert "Plan Mode" in str(app.query_one("#ready", Static).render())
 
         input_widget.load_text("分析修改方案")
@@ -264,7 +274,7 @@ async def test_plan_mode_and_do_command():
         await wait_until_idle(app, pilot)
 
         assert app.agent.can_execute_plan() is True
-        assert [tool.name for tool in provider.requests[0]["tools"]] == [
+        assert [tool.name for tool in client.requests[0].tools] == [
             "Read",
             "Glob",
             "Grep",
@@ -275,32 +285,128 @@ async def test_plan_mode_and_do_command():
         await wait_until_idle(app, pilot)
 
         assert app.agent.mode == "default"
-        assert provider.requests[1]["messages"][-1].content == DO_PLAN_PROMPT
-        assert len(provider.requests[1]["tools"]) == 6
-        assert "对话服务已就绪" in str(app.query_one("#ready", Static).render())
+        assert client.requests[1].messages[-1].content == DO_PLAN_PROMPT
+        assert len(client.requests[1].tools) == 6
+        assert "Default" in str(app.query_one("#ready", Static).render())
+
+
+async def test_permission_screen_defaults_to_allow_once_and_accepts_enter():
+    app = app_with_client(FakeClient())
+    selected = []
+    call = ToolCall("write", "Write", {"path": "demo.txt", "content": "x"})
+    request = PermissionRequest(call, "default 模式需要确认", "Write(demo.txt)", "Write(demo.txt)")
+
+    async with app.run_test(size=(90, 30)) as pilot:
+        app.session_state = SessionState.APPROVING
+        app.push_screen(PermissionApprovalScreen(request), callback=selected.append)
+        await pilot.pause()
+
+        options = app.screen.query_one("#permission-options", OptionList)
+        assert options.highlighted == 0
+        assert "Write(demo.txt)" in str(
+            app.screen.query_one("#permission-summary", Static).render()
+        )
+
+        await pilot.press("down", "enter")
+        await pilot.pause()
+        assert selected == [ApprovalChoice.ALLOW_ALWAYS]
+
+
+async def test_shift_tab_cycles_permission_modes_and_updates_status():
+    app = app_with_client(FakeClient())
+
+    async with app.run_test(size=(90, 30)) as pilot:
+        assert app.agent is not None
+        assert app.agent.mode is PermissionMode.DEFAULT
+
+        await pilot.press("shift+tab")
+        assert app.agent.mode is PermissionMode.ACCEPT_EDITS
+        assert str(app.query_one("#provider-name", Static).render()) == "acceptEdits"
+
+        await pilot.press("shift+tab", "shift+tab", "shift+tab")
+        assert app.agent.mode is PermissionMode.DEFAULT
+
+
+async def test_write_permission_allow_once_runs_and_returns_to_idle(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    tool_call = ToolCall("write", "Write", {"path": "approved.txt", "content": "ok"})
+    client = FakeClient(
+        responses=[
+            complete_response("", calls=[tool_call]),
+            complete_response("写入完成"),
+        ]
+    )
+    app = app_with_client(client)
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        app.query_one("#message-input", MessageInput).load_text("写文件")
+        await pilot.press("enter")
+        await wait_until_state(app, pilot, SessionState.APPROVING)
+
+        assert app.query_one("#message-input", MessageInput).disabled is True
+        assert "Imagining" in str(app.query_one("#timer", Static).render())
+        await pilot.press("1")
+        await wait_until_idle(app, pilot)
+
+        assert (tmp_path / "approved.txt").read_text(encoding="utf-8") == "ok"
+        conversation = app.query_one("#conversation", RichLog)
+        conversation.text_select_all()
+        assert "写入完成" in (app.screen.get_selected_text() or "")
+
+
+async def test_escape_cancels_permission_without_exiting(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    tool_call = ToolCall("write", "Write", {"path": "cancelled.txt", "content": "no"})
+    client = FakeClient(
+        responses=[
+            complete_response("", calls=[tool_call]),
+            complete_response("取消后恢复"),
+        ]
+    )
+    app = app_with_client(client)
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        app.query_one("#message-input", MessageInput).load_text("写文件")
+        await pilot.press("enter")
+        await wait_until_state(app, pilot, SessionState.APPROVING)
+
+        await pilot.press("escape")
+        await wait_until_idle(app, pilot)
+
+        assert app.is_running is True
+        assert not (tmp_path / "cancelled.txt").exists()
+        assert app.query_one("#message-input", MessageInput).disabled is False
+        assert app.query_one("#message-input", MessageInput).has_focus is True
+
+        # 即使真实终端没有把焦点正确还给 TextArea，应用级 Enter 也能兜底提交。
+        app.set_focus(None)
+        app.query_one("#message-input", MessageInput).load_text("继续")
+        app.action_submit_current_input()
+        await wait_until_idle(app, pilot)
+        assert client.requests[-1].messages[-1].content == "继续"
 
 
 async def test_plan_with_inline_task_and_do_without_plan():
-    provider = FakeProvider(responses=[complete_response("内联计划")])
-    app = app_with_provider(provider)
+    client = FakeClient(responses=[complete_response("内联计划")])
+    app = app_with_client(client)
 
     async with app.run_test(size=(100, 30)) as pilot:
         input_widget = app.query_one("#message-input", MessageInput)
         input_widget.load_text("/do")
         await pilot.press("enter")
         await pilot.pause()
-        assert len(provider.requests) == 0
+        assert len(client.requests) == 0
 
         input_widget.load_text("/plan 分析项目结构")
         await pilot.press("enter")
         await wait_until_idle(app, pilot)
 
-        assert provider.requests[0]["messages"][-1].content == "分析项目结构"
+        assert client.requests[0].messages[-1].content == "分析项目结构"
         assert app.agent is not None
         assert app.agent.can_execute_plan() is True
 
 
-class CancelThenSucceedProvider(FakeProvider):
+class CancelThenSucceedClient(FakeClient):
     """第一轮阻塞供取消，第二轮正常完成。"""
 
     def __init__(self):
@@ -309,40 +415,40 @@ class CancelThenSucceedProvider(FakeProvider):
         self.started = asyncio.Event()
         self.closed = False
 
-    async def stream(self, messages, system_prompt, tools):
+    async def stream(self, request):
         self.calls += 1
         if self.calls == 1:
             try:
                 self.started.set()
-                yield ProviderEvent("text_delta", text="部分回复")
+                yield LLMEvent("text_delta", text="部分回复")
                 await asyncio.sleep(10)
             finally:
                 self.closed = True
             return
 
-        yield ProviderEvent("text_delta", text="取消后恢复成功")
-        yield ProviderEvent("usage", usage=TokenUsage(2, 1))
-        yield ProviderEvent(
+        yield LLMEvent("text_delta", text="取消后恢复成功")
+        yield LLMEvent("usage", usage=TokenUsage(2, 1))
+        yield LLMEvent(
             "completed",
             message=ChatMessage("assistant", "取消后恢复成功"),
         )
 
 
 async def test_escape_cancels_turn_and_next_message_succeeds():
-    provider = CancelThenSucceedProvider()
-    app = app_with_provider(provider)
+    client = CancelThenSucceedClient()
+    app = app_with_client(client)
 
     async with app.run_test(size=(100, 30)) as pilot:
         input_widget = app.query_one("#message-input", MessageInput)
         input_widget.load_text("慢任务")
         await pilot.press("enter")
-        await provider.started.wait()
+        await client.started.wait()
 
         await pilot.press("escape")
         await wait_until_idle(app, pilot)
 
         assert app.is_running is True
-        assert provider.closed is True
+        assert client.closed is True
         assert app.agent is not None
         assert app.agent.conversation.get_messages() == []
 
@@ -350,13 +456,13 @@ async def test_escape_cancels_turn_and_next_message_succeeds():
         await pilot.press("enter")
         await wait_until_idle(app, pilot)
 
-        assert provider.calls == 2
+        assert client.calls == 2
         assert app.reply_buffer == "取消后恢复成功"
 
 
 async def test_ctrl_c_cancels_streaming_but_idle_escape_does_nothing():
-    provider = CancelThenSucceedProvider()
-    app = app_with_provider(provider)
+    client = CancelThenSucceedClient()
+    app = app_with_client(client)
 
     async with app.run_test(size=(100, 30)) as pilot:
         await pilot.press("escape")
@@ -365,29 +471,29 @@ async def test_ctrl_c_cancels_streaming_but_idle_escape_does_nothing():
 
         app.query_one("#message-input", MessageInput).load_text("慢任务")
         await pilot.press("enter")
-        await provider.started.wait()
+        await client.started.wait()
         await pilot.press("ctrl+c")
         await wait_until_idle(app, pilot)
 
         assert app.is_running is True
-        assert provider.closed is True
+        assert client.closed is True
 
 
 async def test_error_recovers_and_next_turn_succeeds():
-    class FailThenSucceedProvider(FakeProvider):
+    class FailThenSucceedClient(FakeClient):
         def __init__(self):
             super().__init__()
             self.calls = 0
 
-        async def stream(self, messages, system_prompt, tools):
+        async def stream(self, request):
             self.calls += 1
             if self.calls == 1:
-                raise ProviderError("authentication", "鉴权失败")
-            yield ProviderEvent("text_delta", text="恢复成功")
-            yield ProviderEvent("completed", message=ChatMessage("assistant", "恢复成功"))
+                raise LLMError("authentication", "鉴权失败")
+            yield LLMEvent("text_delta", text="恢复成功")
+            yield LLMEvent("completed", message=ChatMessage("assistant", "恢复成功"))
 
-    provider = FailThenSucceedProvider()
-    app = app_with_provider(provider)
+    client = FailThenSucceedClient()
+    app = app_with_client(client)
 
     async with app.run_test(size=(90, 30)) as pilot:
         input_widget = app.query_one("#message-input", MessageInput)
@@ -401,23 +507,23 @@ async def test_error_recovers_and_next_turn_succeeds():
         await pilot.press("enter")
         await wait_until_idle(app, pilot)
 
-        assert provider.calls == 2
+        assert client.calls == 2
         assert app.reply_buffer == "恢复成功"
 
 
 async def test_streaming_rejects_second_submit():
-    class CountingProvider(FakeProvider):
+    class CountingClient(FakeClient):
         def __init__(self):
             super().__init__(chunks=["完成"], delay=0.1)
             self.calls = 0
 
-        async def stream(self, messages, system_prompt, tools):
+        async def stream(self, request):
             self.calls += 1
-            async for event in super().stream(messages, system_prompt, tools):
+            async for event in super().stream(request):
                 yield event
 
-    provider = CountingProvider()
-    app = app_with_provider(provider)
+    client = CountingClient()
+    app = app_with_client(client)
 
     async with app.run_test(size=(90, 30)) as pilot:
         app.query_one("#message-input", MessageInput).load_text("第一条")
@@ -427,11 +533,11 @@ async def test_streaming_rejects_second_submit():
         app.on_message_input_submitted(MessageInput.Submitted("第二条"))
         await wait_until_idle(app, pilot)
 
-        assert provider.calls == 1
+        assert client.calls == 1
 
 
 async def test_exit_command():
-    app = app_with_provider(FakeProvider())
+    app = app_with_client(FakeClient())
 
     async with app.run_test(size=(80, 24)) as pilot:
         app.query_one("#message-input", MessageInput).load_text("/exit")
@@ -442,8 +548,8 @@ async def test_exit_command():
 
 
 async def test_ctrl_c_copies_selection_and_keeps_running():
-    provider = FakeProvider(chunks=["仍可继续"])
-    app = app_with_provider(provider)
+    client = FakeClient(chunks=["仍可继续"])
+    app = app_with_client(client)
 
     async with app.run_test(size=(80, 24)) as pilot:
         conversation = app.query_one("#conversation", RichLog)
@@ -477,11 +583,11 @@ async def test_ctrl_c_copies_selection_and_keeps_running():
         await pilot.press("enter")
         await wait_until_idle(app, pilot)
 
-        assert provider.received_messages[-1].content == "复制后继续对话"
+        assert client.received_messages[-1].content == "复制后继续对话"
 
 
 async def test_chat_history_selection_includes_all_message_types():
-    app = app_with_provider(FakeProvider())
+    app = app_with_client(FakeClient())
 
     async with app.run_test(size=(80, 24)) as pilot:
         conversation = app.query_one("#conversation", RichLog)
@@ -503,7 +609,7 @@ async def test_chat_history_selection_includes_all_message_types():
 
 
 async def test_ctrl_c_exit():
-    app = app_with_provider(FakeProvider())
+    app = app_with_client(FakeClient())
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press("ctrl+c")
@@ -513,7 +619,7 @@ async def test_ctrl_c_exit():
 
 
 async def test_narrow_terminal_keeps_main_widgets():
-    app = app_with_provider(FakeProvider())
+    app = app_with_client(FakeClient())
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.resize_terminal(42, 18)

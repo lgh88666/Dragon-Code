@@ -1,10 +1,28 @@
 """Dragon Code 的 ReAct Agent Loop。"""
 
 import asyncio
+from pathlib import Path
 
-from dragon_code.models import AgentEvent, ChatMessage, TokenUsage, ToolCall, ToolResult
-from dragon_code.prompt import build_agent_prompt
-from dragon_code.providers.base import BaseProvider, ProviderError
+from dragon_code.clients.base import LLMClient, LLMError
+from dragon_code.models import (
+    AgentEvent,
+    ChatMessage,
+    LLMRequest,
+    TokenUsage,
+    ToolCall,
+    ToolResult,
+)
+from dragon_code.permissions import (
+    ApprovalChoice,
+    PermissionDecision,
+    PermissionMode,
+    PermissionRequest,
+    PermissionResult,
+)
+from dragon_code.permissions.approval import ApprovalController
+from dragon_code.permissions.engine import PermissionEngine
+from dragon_code.permissions.rules import RuleParseError, RuleStore, make_exact_rule
+from dragon_code.prompt import build_system_prompt, plan_reminder
 from dragon_code.session import Conversation
 from dragon_code.stream_collector import StreamCollector
 from dragon_code.tool_scheduler import ToolBatch, ToolScheduler
@@ -19,59 +37,93 @@ class Agent:
 
     def __init__(
         self,
-        provider: BaseProvider,
+        client: LLMClient,
         conversation: Conversation,
-        system_prompt: str,
         registry: ToolRegistry,
+        working_dir: Path,
+        version: str,
         max_iterations: int = 50,
         unknown_tool_limit: int = 3,
+        permission_engine: PermissionEngine | None = None,
+        approval_controller: ApprovalController | None = None,
+        permission_mode: PermissionMode = PermissionMode.DEFAULT,
     ):
-        self.provider = provider
+        self.client = client
         self.conversation = conversation
-        self.system_prompt = system_prompt
         self.registry = registry
+        self.working_dir = working_dir.resolve()
+        self.version = version
         self.plan_registry = registry.subset({"Read", "Glob", "Grep"})
         self.max_iterations = max_iterations
         self.unknown_tool_limit = unknown_tool_limit
 
-        self.mode = "default"
+        # 默认空规则只用于向后兼容和测试；TUI 启动时会注入真实三级配置。
+        if permission_engine is None:
+            empty_rules = RuleStore.empty(self.working_dir)
+            permission_engine = PermissionEngine(self.working_dir, empty_rules)
+        self.permission_engine = permission_engine
+        self.approval_controller = approval_controller or ApprovalController()
+
+        self.mode = permission_mode
         self.has_plan = False
         self.cancel_requested = False
         self.task_usage = TokenUsage(0, 0)
-        self.active_provider_task: asyncio.Task | None = None
+        self.active_client_task: asyncio.Task | None = None
         self.scheduler: ToolScheduler | None = None
 
     def enter_plan_mode(self) -> None:
         """进入持续计划模式；从 Default 进入时清空旧计划标记。"""
 
-        if self.mode != "plan":
-            self.has_plan = False
-        self.mode = "plan"
+        self.set_permission_mode(PermissionMode.PLAN)
 
     def can_execute_plan(self) -> bool:
-        return self.mode == "plan" and self.has_plan
+        return self.mode is PermissionMode.PLAN and self.has_plan
 
     def enter_default_mode(self) -> None:
-        self.mode = "default"
-        self.has_plan = False
+        self.set_permission_mode(PermissionMode.DEFAULT)
+
+    def set_permission_mode(self, mode: PermissionMode) -> None:
+        """切换会话权限模式，并清理不再适用的旧计划。"""
+
+        if mode is not self.mode:
+            self.has_plan = False
+        self.mode = mode
+
+    def cycle_permission_mode(self) -> PermissionMode:
+        """按固定顺序切换权限模式，供 Shift+Tab 使用。"""
+
+        modes = list(PermissionMode)
+        current_index = modes.index(self.mode)
+        self.set_permission_mode(modes[(current_index + 1) % len(modes)])
+        return self.mode
+
+    def resolve_permission(self, call_id: str, choice: ApprovalChoice) -> None:
+        """接收 TUI 对当前权限确认的回答。"""
+
+        self.approval_controller.resolve(call_id, choice)
 
     def request_cancel(self) -> None:
         """停止当前网络等待或工具批次，外层循环负责合法收尾。"""
 
         self.cancel_requested = True
-        if self.active_provider_task is not None and not self.active_provider_task.done():
-            self.active_provider_task.cancel()
+        if self.active_client_task is not None and not self.active_client_task.done():
+            self.active_client_task.cancel()
         if self.scheduler is not None:
             self.scheduler.cancel_active()
+        self.approval_controller.cancel()
 
     async def run(self, user_text: str):
         """运行一个完整任务，异步产出界面所需事件。"""
 
         self.cancel_requested = False
         self.task_usage = TokenUsage(0, 0)
-        active_registry = self.plan_registry if self.mode == "plan" else self.registry
+        active_registry = self.plan_registry if self.mode is PermissionMode.PLAN else self.registry
         self.scheduler = ToolScheduler(active_registry)
-        system_prompt = build_agent_prompt(self.system_prompt, self.mode)
+        system_prompt = await build_system_prompt(
+            self.working_dir,
+            self.version,
+            self.client.model,
+        )
 
         request_messages = self.conversation.build_request_messages(user_text)
         user_message = request_messages[-1]
@@ -86,19 +138,22 @@ class Agent:
             )
 
             collector = StreamCollector()
-            stream = self.provider.stream(
-                request_messages,
-                system_prompt,
-                active_registry.definitions(),
+            reminder = plan_reminder(iteration) if self.mode is PermissionMode.PLAN else None
+            llm_request = LLMRequest(
+                messages=list(request_messages),
+                tools=active_registry.definitions(),
+                system=system_prompt,
+                reminder=reminder,
             )
+            stream = self.client.stream(llm_request)
             iterator = stream.__aiter__()
             stream_cancelled = False
 
             try:
                 while True:
-                    self.active_provider_task = asyncio.create_task(anext(iterator))
+                    self.active_client_task = asyncio.create_task(anext(iterator))
                     try:
-                        provider_event = await self.active_provider_task
+                        llm_event = await self.active_client_task
                     except StopAsyncIteration:
                         break
                     except asyncio.CancelledError:
@@ -107,12 +162,12 @@ class Agent:
                         stream_cancelled = True
                         break
                     finally:
-                        self.active_provider_task = None
+                        self.active_client_task = None
 
-                    agent_event = collector.accept(provider_event)
+                    agent_event = collector.accept(llm_event)
                     if agent_event is not None:
                         yield agent_event
-            except ProviderError as error:
+            except LLMError as error:
                 yield AgentEvent(type="error", error=error, usage=self.task_usage)
                 return
             finally:
@@ -131,7 +186,7 @@ class Agent:
 
             try:
                 response = collector.finish()
-            except ProviderError as error:
+            except LLMError as error:
                 yield AgentEvent(type="error", error=error, usage=self.task_usage)
                 return
 
@@ -146,7 +201,7 @@ class Agent:
                 messages_to_commit.append(assistant_message)
                 self.conversation.commit_messages(messages_to_commit)
 
-                if self.mode == "plan":
+                if self.mode is PermissionMode.PLAN:
                     self.has_plan = True
                 yield AgentEvent(
                     type="completed",
@@ -207,7 +262,7 @@ class Agent:
         yield AgentEvent(type="limit", text=ITERATION_LIMIT_MESSAGE, usage=self.task_usage)
 
     async def _execute_tools(self, calls: list[ToolCall]):
-        """按批次产生工具开始与结束事件。"""
+        """先检查权限，再按原批次执行并保序返回结果。"""
 
         if self.scheduler is None:
             return
@@ -223,14 +278,136 @@ class Agent:
             for call in batch.calls:
                 yield AgentEvent(type="tool_start", tool_call=call)
 
-            batch_results = await self.scheduler.execute_batch(batch)
-            for result in batch_results:
+            results: list[ToolResult | None] = [None] * len(batch.calls)
+            allowed_calls: list[ToolCall] = []
+            allowed_indexes: list[int] = []
+
+            for call_index, call in enumerate(batch.calls):
+                permission = self.permission_engine.check(
+                    call,
+                    self.scheduler.registry.get(call.name),
+                    self.mode,
+                )
+                if permission.decision is PermissionDecision.DENY:
+                    results[call_index] = self._permission_denied_result(call, permission)
+                    continue
+
+                if permission.decision is PermissionDecision.ASK:
+                    try:
+                        exact_rule = make_exact_rule(call, self.working_dir)
+                    except RuleParseError:
+                        exact_rule = ""
+                    future = self.approval_controller.begin(call.id)
+                    yield AgentEvent(
+                        type="permission_request",
+                        permission_request=PermissionRequest(
+                            call=call,
+                            reason=permission.reason,
+                            summary=self._permission_summary(call),
+                            exact_rule=exact_rule,
+                        ),
+                    )
+                    try:
+                        choice = await future
+                    except asyncio.CancelledError:
+                        self.cancel_requested = True
+                        break
+
+                    if choice is ApprovalChoice.DENY_ONCE:
+                        user_denial = PermissionResult(
+                            PermissionDecision.DENY,
+                            "user",
+                            "用户拒绝了本次工具调用。",
+                        )
+                        results[call_index] = self._permission_denied_result(call, user_denial)
+                        continue
+                    if choice is ApprovalChoice.ALLOW_ALWAYS:
+                        try:
+                            if not exact_rule:
+                                raise RuleParseError("无法生成精确规则。")
+                            self.permission_engine.rule_store.save_local_allow(exact_rule)
+                        except (OSError, RuleParseError):
+                            yield AgentEvent(
+                                type="permission_warning",
+                                text="永久权限保存失败，本次仍按允许一次执行。",
+                            )
+
+                allowed_indexes.append(call_index)
+                allowed_calls.append(call)
+
+            if self.cancel_requested:
+                for result_index, call in enumerate(batch.calls):
+                    if results[result_index] is None:
+                        results[result_index] = self.scheduler.make_cancelled_results([call])[0]
+                for result in results:
+                    if result is not None:
+                        yield AgentEvent(type="tool_end", tool_result=result)
+                for result in self._cancel_remaining_batches(batches[index + 1 :]):
+                    yield AgentEvent(type="tool_end", tool_result=result)
+                return
+
+            if allowed_calls:
+                allowed_batch = ToolBatch(calls=allowed_calls, concurrent=batch.concurrent)
+                executed = await self.scheduler.execute_batch(allowed_batch)
+                for result_index, result in zip(allowed_indexes, executed, strict=True):
+                    results[result_index] = result
+
+            for call, result in zip(batch.calls, results, strict=True):
+                if result is None:
+                    result = ToolResult(
+                        call_id=call.id,
+                        tool_name=call.name,
+                        success=False,
+                        error_code="tool_error",
+                        error_message="工具没有产生可用结果。",
+                    )
                 yield AgentEvent(type="tool_end", tool_result=result)
 
             if self.cancel_requested:
                 for result in self._cancel_remaining_batches(batches[index + 1 :]):
                     yield AgentEvent(type="tool_end", tool_result=result)
                 return
+
+    @staticmethod
+    def _permission_summary(call: ToolCall) -> str:
+        """生成适合确认框显示的单行关键参数。"""
+
+        arguments = call.arguments or {}
+        if call.name == "Bash":
+            value = arguments.get("command", "")
+        elif call.name == "Glob":
+            value = arguments.get("pattern", "")
+        else:
+            value = arguments.get("path", "")
+        one_line = str(value).replace("\r", " ").replace("\n", " ")
+        if len(one_line) > 160:
+            one_line = one_line[:157] + "..."
+        return f"{call.name}({one_line})"
+
+    @staticmethod
+    def _permission_denied_result(
+        call: ToolCall,
+        permission: PermissionResult,
+    ) -> ToolResult:
+        """把权限拒绝转换为可以安全回灌给模型的工具结果。"""
+
+        if permission.source == "unknown_tool":
+            error_code = "unknown_tool"
+        elif permission.source == "invalid_arguments":
+            error_code = "invalid_json"
+        else:
+            error_code = "permission_denied"
+        return ToolResult(
+            call_id=call.id,
+            tool_name=call.name,
+            success=False,
+            error_code=error_code,
+            error_message=permission.reason,
+            metadata={
+                "permission_source": permission.source,
+                "matched_rule": permission.matched_rule,
+            },
+        )
 
     def _cancel_remaining_batches(self, batches: list[ToolBatch]) -> list[ToolResult]:
         if self.scheduler is None:

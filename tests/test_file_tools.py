@@ -56,6 +56,14 @@ async def test_edit_requires_unique_match(tmp_path):
     assert path.read_text(encoding="utf-8") == "重复 重复"
 
 
+def test_edit_definition_requires_read_and_unique_match(tmp_path):
+    definition = EditTool(tmp_path).definition()
+
+    assert "编辑前必须先使用 Read" in definition.description
+    assert "恰好匹配一次" in definition.description
+    assert "已经通过 Read 确认" in definition.input_schema["properties"]["old_text"]["description"]
+
+
 async def test_file_tools_reject_outside_path(tmp_path):
     outside = tmp_path.parent / "outside-dragon-test.txt"
     write_result = await WriteTool(tmp_path).execute(

@@ -24,7 +24,9 @@ class WriteArguments(BaseModel):
 
 class EditArguments(BaseModel):
     path: str = Field(description="要修改的文本文件路径。")
-    old_text: str = Field(description="文件中必须恰好出现一次的原文片段。")
+    old_text: str = Field(
+        description="已经通过 Read 确认、并且在文件中必须恰好出现一次的原文片段。"
+    )
     new_text: str = Field(description="用于替换原文片段的新文本。")
 
 
@@ -104,7 +106,7 @@ class WriteTool(WorkspaceTool):
 class EditTool(WorkspaceTool):
     name = "Edit"
     description = (
-        "在工作目录内的 UTF-8 文件中做一次原文精确替换。"
+        "精确修改工作目录内的 UTF-8 文件。编辑前必须先使用 Read 读取并确认当前内容。"
         "old_text 必须恰好匹配一次；零次或多次都会拒绝修改。"
     )
     category = "filesystem"

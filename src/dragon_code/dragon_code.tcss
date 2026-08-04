@@ -84,6 +84,49 @@ Screen {
     text-align: right;
 }
 
+PermissionApprovalScreen {
+    align: center middle;
+    background: $background 70%;
+}
+
+#permission-dialog {
+    width: 75%;
+    max-width: 84;
+    height: auto;
+    max-height: 80%;
+    border: round $warning;
+    background: $surface;
+    padding: 1 2;
+}
+
+#permission-title {
+    width: 1fr;
+    height: 2;
+    color: $warning;
+    text-style: bold;
+}
+
+#permission-summary {
+    width: 1fr;
+    height: auto;
+    margin-bottom: 1;
+    color: $text;
+    text-style: bold;
+}
+
+#permission-reason {
+    width: 1fr;
+    height: auto;
+    margin-bottom: 1;
+    color: $text-muted;
+}
+
+#permission-options {
+    width: 1fr;
+    height: auto;
+    max-height: 8;
+}
+
 ProviderSelectScreen {
     align: center middle;
     background: $background 70%;

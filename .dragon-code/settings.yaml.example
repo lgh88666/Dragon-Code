@@ -1,0 +1,17 @@
+# Dragon Code 权限设置示例。
+# 可复制为项目共享的 .dragon-code/settings.yaml；
+# 只在本机生效的规则写入 .dragon-code/settings.local.yaml。
+
+permissions:
+  # default / acceptEdits / plan / bypassPermissions
+  mode: default
+
+  allow:
+    # 精确允许一条命令。
+    - Bash(git status)
+    # * 匹配单层路径，** 可以跨目录。
+    - Read(docs/**)
+
+  deny:
+    - Read(.env)
+    - Write(.git/**)

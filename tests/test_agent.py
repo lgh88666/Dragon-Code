@@ -1,18 +1,23 @@
 """Agent Loop、停止条件、取消和模式测试。"""
 
 import asyncio
+from pathlib import Path
 
 from pydantic import BaseModel
 
 from dragon_code.agent import Agent
+from dragon_code.clients.base import LLMClient, LLMError
 from dragon_code.models import (
+    AgentEvent,
     ChatMessage,
+    LLMEvent,
     ProviderConfig,
-    ProviderEvent,
     TokenUsage,
     ToolCall,
 )
-from dragon_code.providers.base import BaseProvider, ProviderError
+from dragon_code.permissions import ApprovalChoice, PermissionMode, PermissionRequest
+from dragon_code.permissions.engine import PermissionEngine
+from dragon_code.permissions.rules import RuleStore
 from dragon_code.session import Conversation
 from dragon_code.tools.base import Tool
 from dragon_code.tools.registry import ToolRegistry, create_default_registry
@@ -46,20 +51,14 @@ class DemoTool(Tool):
         return self._success(call, f"result-{call.id}")
 
 
-class SequenceProvider(BaseProvider):
+class SequenceClient(LLMClient):
     def __init__(self, responses):
         super().__init__(ProviderConfig("Fake", "openai", "key", "model"))
         self.responses = list(responses)
         self.requests = []
 
-    async def stream(self, messages, system_prompt, tools):
-        self.requests.append(
-            {
-                "messages": list(messages),
-                "system_prompt": system_prompt,
-                "tools": list(tools),
-            }
-        )
+    async def stream(self, request):
+        self.requests.append(request)
         response = self.responses.pop(0)
         if isinstance(response, Exception):
             raise response
@@ -67,16 +66,16 @@ class SequenceProvider(BaseProvider):
             yield event
 
 
-class BlockingProvider(BaseProvider):
+class BlockingClient(LLMClient):
     def __init__(self):
         super().__init__(ProviderConfig("Fake", "openai", "key", "model"))
         self.started = asyncio.Event()
         self.closed = False
 
-    async def stream(self, messages, system_prompt, tools):
+    async def stream(self, request):
         try:
             self.started.set()
-            yield ProviderEvent("text_delta", text="部分")
+            yield LLMEvent("text_delta", text="部分")
             await asyncio.sleep(10)
         finally:
             self.closed = True
@@ -84,11 +83,11 @@ class BlockingProvider(BaseProvider):
 
 def response(content="", calls=None, usage=(10, 2)):
     calls = calls or []
-    events = [ProviderEvent("tool_call", tool_call=call) for call in calls]
+    events = [LLMEvent("tool_call", tool_call=call) for call in calls]
     events.extend(
         [
-            ProviderEvent("usage", usage=TokenUsage(*usage)),
-            ProviderEvent(
+            LLMEvent("usage", usage=TokenUsage(*usage)),
+            LLMEvent(
                 "completed",
                 message=ChatMessage("assistant", content=content, tool_calls=calls),
             ),
@@ -104,14 +103,238 @@ def registry_with(*tools):
     return registry
 
 
+def make_agent(
+    client,
+    conversation=None,
+    registry=None,
+    working_dir=None,
+    **kwargs,
+):
+    """用统一的测试环境参数创建 Agent。"""
+
+    return Agent(
+        client,
+        conversation if conversation is not None else Conversation(),
+        registry if registry is not None else ToolRegistry(),
+        Path(working_dir) if working_dir is not None else Path.cwd(),
+        "test-version",
+        **kwargs,
+    )
+
+
 async def collect(agent, text="执行"):
     return [event async for event in agent.run(text)]
 
 
-async def test_natural_plain_response_commits_once():
-    provider = SequenceProvider([response("完成")])
+async def collect_with_approval(agent, choice, text="执行"):
+    """消费事件，并在出现权限确认时立即选择指定答案。"""
+
+    events = []
+    async for event in agent.run(text):
+        events.append(event)
+        if event.type == "permission_request":
+            agent.resolve_permission(event.permission_request.call.id, choice)
+    return events
+
+
+def permission_engine(working_dir, *, load_settings=False):
+    root = Path(working_dir)
+    rules = (
+        RuleStore.load(root, user_home=root / "fake-home")
+        if load_settings
+        else RuleStore.empty(root)
+    )
+    return PermissionEngine(root, rules)
+
+
+def test_permission_event_model_can_hold_request():
+    call = ToolCall("1", "Write", {"path": "a.txt", "content": "x"})
+    request = PermissionRequest(call, "需要确认", "Write(a.txt)", "Write(a.txt)")
+    event = AgentEvent(type="permission_request", permission_request=request)
+    assert event.permission_request is request
+
+
+def test_permission_mode_cycles_in_fixed_order():
+    client = SequenceClient([response("完成")])
+    agent = make_agent(client)
+
+    assert agent.mode is PermissionMode.DEFAULT
+    assert agent.cycle_permission_mode() is PermissionMode.ACCEPT_EDITS
+    assert agent.cycle_permission_mode() is PermissionMode.PLAN
+    assert agent.cycle_permission_mode() is PermissionMode.BYPASS_PERMISSIONS
+    assert agent.cycle_permission_mode() is PermissionMode.DEFAULT
+
+
+async def test_blacklist_denial_returns_result_without_execution(tmp_path):
+    from dragon_code.tools.bash import BashTool
+
+    bash = BashTool(tmp_path)
+    dangerous = ToolCall("danger", "Bash", {"command": "rm -rf /"})
+    client = SequenceClient([response(calls=[dangerous]), response("已改用安全方案")])
+    agent = make_agent(
+        client,
+        registry=registry_with(bash),
+        working_dir=tmp_path,
+        permission_engine=permission_engine(tmp_path),
+        permission_mode=PermissionMode.BYPASS_PERMISSIONS,
+    )
+
+    events = await collect(agent)
+    denial = next(event.tool_result for event in events if event.type == "tool_end")
+    assert denial.error_code == "permission_denied"
+    assert denial.metadata["permission_source"] == "blacklist"
+    assert events[-1].type == "completed"
+
+
+async def test_write_asks_and_allow_once_executes(tmp_path):
+    from dragon_code.tools.file_tools import WriteTool
+
+    write = WriteTool(tmp_path)
+    tool_call = ToolCall("write", "Write", {"path": "created.txt", "content": "ok"})
+    client = SequenceClient([response(calls=[tool_call]), response("写入完成")])
+    agent = make_agent(
+        client,
+        registry=registry_with(write),
+        working_dir=tmp_path,
+        permission_engine=permission_engine(tmp_path),
+    )
+
+    events = await collect_with_approval(agent, ApprovalChoice.ALLOW_ONCE)
+    assert [event.type for event in events].count("permission_request") == 1
+    assert (tmp_path / "created.txt").read_text(encoding="utf-8") == "ok"
+    assert events[-1].type == "completed"
+
+
+async def test_user_denial_is_paired_and_agent_continues(tmp_path):
+    from dragon_code.tools.file_tools import WriteTool
+
+    write = WriteTool(tmp_path)
+    tool_call = ToolCall("write", "Write", {"path": "denied.txt", "content": "no"})
+    client = SequenceClient([response(calls=[tool_call]), response("已停止写入")])
     conversation = Conversation()
-    agent = Agent(provider, conversation, "系统", ToolRegistry())
+    agent = make_agent(
+        client,
+        conversation=conversation,
+        registry=registry_with(write),
+        working_dir=tmp_path,
+        permission_engine=permission_engine(tmp_path),
+    )
+
+    events = await collect_with_approval(agent, ApprovalChoice.DENY_ONCE)
+    denial = next(event.tool_result for event in events if event.type == "tool_end")
+    assert denial.metadata["permission_source"] == "user"
+    assert not (tmp_path / "denied.txt").exists()
+    assert [message.role for message in conversation.get_messages()] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+
+
+async def test_permanent_allow_saves_rule_and_applies_immediately(tmp_path):
+    from dragon_code.tools.file_tools import WriteTool
+
+    write = WriteTool(tmp_path)
+    first = ToolCall("write-1", "Write", {"path": "saved.txt", "content": "one"})
+    second = ToolCall("write-2", "Write", {"path": "saved.txt", "content": "two"})
+    client = SequenceClient([response(calls=[first]), response(calls=[second]), response("完成")])
+    rules = RuleStore.load(tmp_path, user_home=tmp_path / "fake-home")
+    agent = make_agent(
+        client,
+        registry=registry_with(write),
+        working_dir=tmp_path,
+        permission_engine=PermissionEngine(tmp_path, rules),
+    )
+
+    events = await collect_with_approval(agent, ApprovalChoice.ALLOW_ALWAYS)
+    assert [event.type for event in events].count("permission_request") == 1
+    settings = tmp_path / ".dragon-code/settings.local.yaml"
+    assert "Write(saved.txt)" in settings.read_text(encoding="utf-8")
+    assert (tmp_path / "saved.txt").read_text(encoding="utf-8") == "two"
+
+
+async def test_permanent_save_failure_falls_back_to_allow_once(tmp_path, monkeypatch):
+    from dragon_code.tools.file_tools import WriteTool
+
+    write = WriteTool(tmp_path)
+    tool_call = ToolCall("write", "Write", {"path": "fallback.txt", "content": "ok"})
+    client = SequenceClient([response(calls=[tool_call]), response("完成")])
+    rules = RuleStore.empty(tmp_path)
+
+    def fail_to_save(_exact_rule):
+        raise OSError("模拟本地设置不可写")
+
+    monkeypatch.setattr(rules, "save_local_allow", fail_to_save)
+    agent = make_agent(
+        client,
+        registry=registry_with(write),
+        working_dir=tmp_path,
+        permission_engine=PermissionEngine(tmp_path, rules),
+    )
+
+    events = await collect_with_approval(agent, ApprovalChoice.ALLOW_ALWAYS)
+    assert any(event.type == "permission_warning" for event in events)
+    assert (tmp_path / "fallback.txt").read_text(encoding="utf-8") == "ok"
+    assert rules.match(tool_call) is None
+
+
+async def test_cancel_during_permission_keeps_history_paired(tmp_path):
+    from dragon_code.tools.file_tools import WriteTool
+
+    write = WriteTool(tmp_path)
+    tool_call = ToolCall("write", "Write", {"path": "cancelled.txt", "content": "no"})
+    client = SequenceClient([response(calls=[tool_call])])
+    conversation = Conversation()
+    agent = make_agent(
+        client,
+        conversation=conversation,
+        registry=registry_with(write),
+        working_dir=tmp_path,
+        permission_engine=permission_engine(tmp_path),
+    )
+
+    events = []
+    async for event in agent.run("写入"):
+        events.append(event)
+        if event.type == "permission_request":
+            agent.request_cancel()
+
+    assert events[-1].type == "cancelled"
+    assert not (tmp_path / "cancelled.txt").exists()
+    history = conversation.get_messages()
+    assert [message.role for message in history] == ["user", "assistant", "tool"]
+    assert history[-1].tool_results[0].error_code == "cancelled"
+
+
+async def test_read_batch_keeps_order_when_one_path_is_denied(tmp_path):
+    from dragon_code.tools.file_tools import ReadTool
+
+    (tmp_path / "a.txt").write_text("a", encoding="utf-8")
+    (tmp_path / "c.txt").write_text("c", encoding="utf-8")
+    calls = [
+        ToolCall("a", "Read", {"path": "a.txt"}),
+        ToolCall("b", "Read", {"path": "../outside.txt"}),
+        ToolCall("c", "Read", {"path": "c.txt"}),
+    ]
+    client = SequenceClient([response(calls=calls), response("完成")])
+    agent = make_agent(
+        client,
+        registry=registry_with(ReadTool(tmp_path)),
+        working_dir=tmp_path,
+        permission_engine=permission_engine(tmp_path),
+    )
+
+    events = await collect(agent)
+    results = [event.tool_result for event in events if event.type == "tool_end"]
+    assert [result.call_id for result in results] == ["a", "b", "c"]
+    assert [result.success for result in results] == [True, False, True]
+
+
+async def test_natural_plain_response_commits_once():
+    client = SequenceClient([response("完成")])
+    conversation = Conversation()
+    agent = make_agent(client, conversation, ToolRegistry())
 
     events = await collect(agent)
 
@@ -120,7 +343,10 @@ async def test_natural_plain_response_commits_once():
         "usage",
         "completed",
     ]
-    assert len(provider.requests) == 1
+    assert len(client.requests) == 1
+    assert "Dragon Code" in client.requests[0].system.stable
+    assert "test-version" in client.requests[0].system.environment
+    assert client.requests[0].reminder is None
     assert [item.role for item in conversation.get_messages()] == ["user", "assistant"]
     assert events[-1].usage == TokenUsage(10, 2)
 
@@ -129,7 +355,7 @@ async def test_multi_tool_loop_uses_complete_history():
     tool = DemoTool()
     first = ToolCall("1", "Demo", {})
     second = ToolCall("2", "Demo", {})
-    provider = SequenceProvider(
+    client = SequenceClient(
         [
             response(calls=[first]),
             response(calls=[second]),
@@ -137,12 +363,14 @@ async def test_multi_tool_loop_uses_complete_history():
         ]
     )
     conversation = Conversation()
-    agent = Agent(provider, conversation, "系统", registry_with(tool))
+    agent = make_agent(client, conversation, registry_with(tool))
 
     events = await collect(agent)
 
     assert tool.calls == ["1", "2"]
-    assert len(provider.requests) == 3
+    assert len(client.requests) == 3
+    assert all(request.system == client.requests[0].system for request in client.requests)
+    assert all(request.reminder is None for request in client.requests)
     assert [item.role for item in conversation.get_messages()] == [
         "user",
         "assistant",
@@ -159,19 +387,19 @@ async def test_multi_tool_loop_uses_complete_history():
 async def test_event_order_follows_real_work_order():
     tool = DemoTool()
     call = ToolCall("1", "Demo", {})
-    provider = SequenceProvider(
+    client = SequenceClient(
         [
             [
-                ProviderEvent("text_delta", text="先检查"),
+                LLMEvent("text_delta", text="先检查"),
                 *response(calls=[call]),
             ],
             [
-                ProviderEvent("text_delta", text="已完成"),
+                LLMEvent("text_delta", text="已完成"),
                 *response("已完成"),
             ],
         ]
     )
-    agent = Agent(provider, Conversation(), "系统", registry_with(tool))
+    agent = make_agent(client, registry=registry_with(tool))
 
     events = await collect(agent)
 
@@ -190,13 +418,13 @@ async def test_event_order_follows_real_work_order():
 
 async def test_tool_failure_is_returned_and_agent_continues():
     broken = DemoTool("Broken", fail=True)
-    provider = SequenceProvider(
+    client = SequenceClient(
         [
             response(calls=[ToolCall("1", "Broken", {})]),
             response("已根据失败结果调整"),
         ]
     )
-    agent = Agent(provider, Conversation(), "系统", registry_with(broken))
+    agent = make_agent(client, registry=registry_with(broken))
 
     events = await collect(agent)
 
@@ -204,11 +432,11 @@ async def test_tool_failure_is_returned_and_agent_continues():
     assert result.success is False
     assert result.error_code == "tool_error"
     assert events[-1].type == "completed"
-    assert len(provider.requests) == 2
+    assert len(client.requests) == 2
 
 
 async def test_unknown_tool_limit_and_history_pairing():
-    provider = SequenceProvider(
+    client = SequenceClient(
         [
             response(calls=[ToolCall("1", "Missing", {})]),
             response(calls=[ToolCall("2", "Missing", {})]),
@@ -216,17 +444,16 @@ async def test_unknown_tool_limit_and_history_pairing():
         ]
     )
     conversation = Conversation()
-    agent = Agent(
-        provider,
+    agent = make_agent(
+        client,
         conversation,
-        "系统",
         ToolRegistry(),
         unknown_tool_limit=3,
     )
 
     events = await collect(agent)
 
-    assert len(provider.requests) == 3
+    assert len(client.requests) == 3
     assert events[-1].type == "limit"
     tool_messages = [item for item in conversation.get_messages() if item.role == "tool"]
     assert [item.tool_results[0].call_id for item in tool_messages] == ["1", "2", "3"]
@@ -234,7 +461,7 @@ async def test_unknown_tool_limit_and_history_pairing():
 
 async def test_valid_tool_resets_unknown_counter():
     demo = DemoTool()
-    provider = SequenceProvider(
+    client = SequenceClient(
         [
             response(calls=[ToolCall("1", "Missing", {})]),
             response(calls=[ToolCall("2", "Missing", {})]),
@@ -244,27 +471,26 @@ async def test_valid_tool_resets_unknown_counter():
             response("完成"),
         ]
     )
-    agent = Agent(provider, Conversation(), "系统", registry_with(demo))
+    agent = make_agent(client, registry=registry_with(demo))
 
     events = await collect(agent)
 
     assert events[-1].type == "completed"
-    assert len(provider.requests) == 6
+    assert len(client.requests) == 6
 
 
 async def test_iteration_limit_executes_last_tools_without_extra_request():
     demo = DemoTool()
-    provider = SequenceProvider(
+    client = SequenceClient(
         [
             response(calls=[ToolCall("1", "Demo", {})]),
             response(calls=[ToolCall("2", "Demo", {})]),
         ]
     )
     conversation = Conversation()
-    agent = Agent(
-        provider,
+    agent = make_agent(
+        client,
         conversation,
-        "系统",
         registry_with(demo),
         max_iterations=2,
     )
@@ -272,15 +498,15 @@ async def test_iteration_limit_executes_last_tools_without_extra_request():
     events = await collect(agent)
 
     assert demo.calls == ["1", "2"]
-    assert len(provider.requests) == 2
+    assert len(client.requests) == 2
     assert events[-1].type == "limit"
     assert conversation.get_messages()[-1].tool_results[0].call_id == "2"
 
 
 async def test_stream_error_does_not_commit_incomplete_turn():
-    error = ProviderError("network", "网络错误")
+    error = LLMError("network", "网络错误")
     conversation = Conversation()
-    agent = Agent(SequenceProvider([error]), conversation, "系统", ToolRegistry())
+    agent = make_agent(SequenceClient([error]), conversation, ToolRegistry())
 
     events = await collect(agent)
 
@@ -288,10 +514,10 @@ async def test_stream_error_does_not_commit_incomplete_turn():
     assert conversation.get_messages() == []
 
 
-async def test_provider_cancel_discards_partial_response():
-    provider = BlockingProvider()
+async def test_client_cancel_discards_partial_response():
+    client = BlockingClient()
     conversation = Conversation()
-    agent = Agent(provider, conversation, "系统", ToolRegistry())
+    agent = make_agent(client, conversation, ToolRegistry())
     events = []
 
     async def consume():
@@ -299,15 +525,15 @@ async def test_provider_cancel_discards_partial_response():
             events.append(event)
 
     task = asyncio.create_task(consume())
-    await provider.started.wait()
+    await client.started.wait()
     await asyncio.sleep(0)
     agent.request_cancel()
     await task
 
     assert events[-1].type == "cancelled"
     assert conversation.get_messages() == []
-    assert provider.closed is True
-    assert agent.active_provider_task is None
+    assert client.closed is True
+    assert agent.active_client_task is None
 
 
 async def test_tool_cancel_keeps_real_unknown_and_unstarted_results():
@@ -320,12 +546,11 @@ async def test_tool_cancel_keeps_real_unknown_and_unstarted_results():
         ToolCall("2", "Slow", {}),
         ToolCall("3", "Later", {}),
     ]
-    provider = SequenceProvider([response(calls=calls)])
+    client = SequenceClient([response(calls=calls)])
     conversation = Conversation()
-    agent = Agent(
-        provider,
+    agent = make_agent(
+        client,
         conversation,
-        "系统",
         registry_with(fast, slow, later),
     )
     events = []
@@ -351,12 +576,11 @@ async def test_tool_cancel_keeps_real_unknown_and_unstarted_results():
 
 
 async def test_plan_mode_uses_only_read_tools_and_marks_plan_ready(tmp_path):
-    provider = SequenceProvider([response("计划")])
-    agent = Agent(
-        provider,
-        Conversation(),
-        "基础系统提示",
-        create_default_registry(tmp_path),
+    client = SequenceClient([response("计划")])
+    agent = make_agent(
+        client,
+        registry=create_default_registry(tmp_path),
+        working_dir=tmp_path,
     )
     agent.enter_plan_mode()
 
@@ -364,8 +588,8 @@ async def test_plan_mode_uses_only_read_tools_and_marks_plan_ready(tmp_path):
 
     assert events[-1].type == "completed"
     assert agent.can_execute_plan() is True
-    assert [tool.name for tool in provider.requests[0]["tools"]] == ["Read", "Glob", "Grep"]
-    assert "Plan Mode" in provider.requests[0]["system_prompt"]
+    assert [tool.name for tool in client.requests[0].tools] == ["Read", "Glob", "Grep"]
+    assert "Plan Mode" in client.requests[0].reminder
     agent.enter_default_mode()
     assert agent.can_execute_plan() is False
 
@@ -377,17 +601,16 @@ async def test_plan_mode_does_not_execute_hallucinated_write(tmp_path):
         "Write",
         {"path": target.name, "content": "禁止写入"},
     )
-    provider = SequenceProvider(
+    client = SequenceClient(
         [
             response(calls=[write_call]),
             response("只输出计划"),
         ]
     )
-    agent = Agent(
-        provider,
-        Conversation(),
-        "系统",
-        create_default_registry(tmp_path),
+    agent = make_agent(
+        client,
+        registry=create_default_registry(tmp_path),
+        working_dir=tmp_path,
     )
     agent.enter_plan_mode()
 
@@ -397,3 +620,44 @@ async def test_plan_mode_does_not_execute_hallucinated_write(tmp_path):
     assert result.error_code == "unknown_tool"
     assert target.exists() is False
     assert events[-1].type == "completed"
+
+
+async def test_plan_reminder_is_full_every_five_rounds_and_not_persisted(tmp_path):
+    target = tmp_path / "a.txt"
+    target.write_text("内容", encoding="utf-8")
+    calls = [ToolCall(str(index), "Read", {"path": "a.txt"}) for index in range(1, 6)]
+    client = SequenceClient([response(calls=[call]) for call in calls] + [response("最终计划")])
+    conversation = Conversation()
+    agent = make_agent(
+        client,
+        conversation,
+        create_default_registry(tmp_path),
+        working_dir=tmp_path,
+    )
+    agent.enter_plan_mode()
+
+    events = await collect(agent, "制定计划")
+
+    assert events[-1].type == "completed"
+    assert len(client.requests) == 6
+    assert "不能修改文件" in client.requests[0].reminder
+    assert "不能修改文件" not in client.requests[1].reminder
+    assert "不能修改文件" in client.requests[5].reminder
+    assert all(request.system == client.requests[0].system for request in client.requests)
+    assert all("system-reminder" not in item.content for item in conversation.get_messages())
+
+
+async def test_agent_accumulates_cache_usage():
+    tool = DemoTool()
+    call = ToolCall("1", "Demo", {})
+    client = SequenceClient(
+        [
+            response(calls=[call], usage=(10, 2, 30, 0)),
+            response("完成", usage=(5, 1, 0, 30)),
+        ]
+    )
+    agent = make_agent(client, registry=registry_with(tool))
+
+    events = await collect(agent)
+
+    assert events[-1].usage == TokenUsage(15, 3, 30, 30)

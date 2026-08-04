@@ -1,13 +1,21 @@
-"""OpenAI Provider 的工具请求与流式解析测试。"""
+"""OpenAI Client 的工具请求与流式解析测试。"""
 
 from types import SimpleNamespace
 
 import pytest
 
-import dragon_code.providers.openai as openai_module
-from dragon_code.models import ChatMessage, ProviderConfig, ToolCall, ToolDefinition, ToolResult
-from dragon_code.providers.base import ProviderError
-from dragon_code.providers.openai import OpenAIProvider
+import dragon_code.clients.openai as openai_module
+from dragon_code.clients.base import LLMError
+from dragon_code.clients.openai import OpenAIClient
+from dragon_code.models import (
+    ChatMessage,
+    LLMRequest,
+    ProviderConfig,
+    SystemPrompt,
+    ToolCall,
+    ToolDefinition,
+    ToolResult,
+)
 
 
 class FakeStream:
@@ -65,11 +73,13 @@ def chunk(content=None, tool_calls=None):
     return SimpleNamespace(choices=[SimpleNamespace(delta=delta)], usage=None)
 
 
-def usage_chunk(prompt_tokens, completion_tokens):
+def usage_chunk(prompt_tokens, completion_tokens, cached_tokens=None):
     usage = SimpleNamespace(
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
     )
+    if cached_tokens is not None:
+        usage.prompt_tokens_details = SimpleNamespace(cached_tokens=cached_tokens)
     return SimpleNamespace(choices=[], usage=usage)
 
 
@@ -78,20 +88,19 @@ def tool_part(index, call_id=None, name=None, arguments=None):
     return SimpleNamespace(index=index, id=call_id, function=function)
 
 
-async def collect(provider, messages=None):
-    return [
-        event
-        async for event in provider.stream(
-            messages or [ChatMessage("user", "读取文件")],
-            "系统提示",
-            [definition()],
-        )
-    ]
+async def collect(client, messages=None, reminder=None):
+    request = LLMRequest(
+        messages=messages or [ChatMessage("user", "读取文件")],
+        tools=[definition()],
+        system=SystemPrompt("稳定系统提示", "动态环境信息"),
+        reminder=reminder,
+    )
+    return [event async for event in client.stream(request)]
 
 
 async def test_openai_request_contains_tools_and_tool_history():
     FakeClient.chunks = [chunk("完成")]
-    provider = OpenAIProvider(ProviderConfig("OpenAI", "openai", "key", "model"))
+    client = OpenAIClient(ProviderConfig("OpenAI", "openai", "key", "model"))
     call = ToolCall("call_1", "Read", {"path": "a.txt"}, '{"path":"a.txt"}')
     result = ToolResult("call_1", "Read", True, content="内容")
     messages = [
@@ -99,11 +108,40 @@ async def test_openai_request_contains_tools_and_tool_history():
         ChatMessage("assistant", tool_calls=[call]),
         ChatMessage("tool", tool_results=[result]),
     ]
-    await collect(provider, messages)
+    await collect(client, messages)
     request = FakeClient.instances[0].chat.completions.request
     assert request["tools"][0]["function"]["name"] == "Read"
+    assert request["messages"][0] == {
+        "role": "system",
+        "content": "稳定系统提示\n\n动态环境信息",
+    }
+    assert "cache_control" not in str(request)
     assert request["messages"][-1]["role"] == "tool"
     assert request["messages"][-1]["tool_call_id"] == "call_1"
+
+
+async def test_openai_reminder_is_temporary_and_follows_tool_history():
+    call = ToolCall("call_1", "Read", {"path": "a.txt"}, '{"path":"a.txt"}')
+    tool_result = ToolResult("call_1", "Read", True, content="内容")
+    messages = [
+        ChatMessage("user", "读取"),
+        ChatMessage("assistant", tool_calls=[call]),
+        ChatMessage("tool", tool_results=[tool_result]),
+    ]
+
+    await collect(
+        OpenAIClient(ProviderConfig("OpenAI", "openai", "key", "model")),
+        messages,
+        "<system-reminder>只读</system-reminder>",
+    )
+
+    request_messages = FakeClient.instances[0].chat.completions.request["messages"]
+    assert request_messages[-2]["role"] == "tool"
+    assert request_messages[-1] == {
+        "role": "user",
+        "content": "<system-reminder>只读</system-reminder>",
+    }
+    assert messages[-1].tool_results == [tool_result]
 
 
 async def test_openai_joins_multiple_fragmented_calls():
@@ -113,7 +151,7 @@ async def test_openai_joins_multiple_fragmented_calls():
         chunk(tool_calls=[tool_part(0, None, "ad", 'th":"a.txt"}')]),
         chunk(tool_calls=[tool_part(1, None, "ob", 'tern":"*.py"}')]),
     ]
-    events = await collect(OpenAIProvider(ProviderConfig("OpenAI", "openai", "key", "model")))
+    events = await collect(OpenAIClient(ProviderConfig("OpenAI", "openai", "key", "model")))
     calls = [event.tool_call for event in events if event.type == "tool_call"]
     assert [(call.name, call.arguments) for call in calls] == [
         ("Read", {"path": "a.txt"}),
@@ -128,30 +166,41 @@ async def test_openai_text_and_invalid_json_events():
         chunk("正在处理"),
         chunk(tool_calls=[tool_part(0, "x", "Read", "{")]),
     ]
-    events = await collect(OpenAIProvider(ProviderConfig("OpenAI", "openai", "key", "model")))
+    events = await collect(OpenAIClient(ProviderConfig("OpenAI", "openai", "key", "model")))
     assert events[0].type == "text_delta"
     assert events[1].tool_call.arguments is None
     assert events[-1].message.content == "正在处理"
 
 
 async def test_openai_reads_usage_only_chunk_and_closes_stream():
-    FakeClient.chunks = [chunk("完成"), usage_chunk(20, 4)]
-    provider = OpenAIProvider(ProviderConfig("OpenAI", "openai", "key", "model"))
-    events = await collect(provider)
+    FakeClient.chunks = [chunk("完成"), usage_chunk(20, 4, 15)]
+    client = OpenAIClient(ProviderConfig("OpenAI", "openai", "key", "model"))
+    events = await collect(client)
 
     usage_event = next(event for event in events if event.type == "usage")
     completions = FakeClient.instances[0].chat.completions
     assert completions.request["stream_options"] == {"include_usage": True}
     assert usage_event.usage.input_tokens == 20
     assert usage_event.usage.output_tokens == 4
+    assert usage_event.usage.cache_write_tokens == 0
+    assert usage_event.usage.cache_read_tokens == 15
     assert completions.stream.closed is True
+
+
+async def test_openai_allows_missing_cache_usage():
+    FakeClient.chunks = [usage_chunk(20, 4)]
+    events = await collect(OpenAIClient(ProviderConfig("OpenAI", "openai", "key", "model")))
+
+    usage_event = next(event for event in events if event.type == "usage")
+    assert usage_event.usage.cache_write_tokens == 0
+    assert usage_event.usage.cache_read_tokens == 0
 
 
 async def test_openai_closes_stream_after_error():
     FakeClient.chunks = [RuntimeError("broken")]
-    provider = OpenAIProvider(ProviderConfig("OpenAI", "openai", "key", "model"))
+    client = OpenAIClient(ProviderConfig("OpenAI", "openai", "key", "model"))
 
-    with pytest.raises(ProviderError):
-        await collect(provider)
+    with pytest.raises(LLMError):
+        await collect(client)
 
     assert FakeClient.instances[0].chat.completions.stream.closed is True

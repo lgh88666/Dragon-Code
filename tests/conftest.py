@@ -1,20 +1,20 @@
-"""多个测试模块共用的假 Provider。"""
+"""多个测试模块共用的假 LLM Client。"""
 
 import asyncio
 
-from dragon_code.models import ChatMessage, ProviderConfig, ProviderEvent
-from dragon_code.providers.base import BaseProvider, ProviderError
+from dragon_code.clients.base import LLMClient, LLMError
+from dragon_code.models import ChatMessage, LLMEvent, ProviderConfig
 
 
-class FakeProvider(BaseProvider):
+class FakeClient(LLMClient):
     """按预设分片返回内容，也可以模拟失败或延迟。"""
 
     def __init__(
         self,
         chunks: list[str] | None = None,
-        events: list[ProviderEvent] | None = None,
-        responses: list[list[ProviderEvent] | ProviderError] | None = None,
-        error: ProviderError | None = None,
+        events: list[LLMEvent] | None = None,
+        responses: list[list[LLMEvent] | LLMError] | None = None,
+        error: LLMError | None = None,
         delay: float = 0,
     ):
         config = ProviderConfig("Fake", "openai", "fake-key", "fake-model")
@@ -24,28 +24,22 @@ class FakeProvider(BaseProvider):
         self.responses = list(responses or [])
         self.error = error
         self.delay = delay
+        self.requests = []
         self.received_messages = []
         self.received_system_prompt = ""
         self.received_tools = []
-        self.requests = []
 
-    async def stream(self, messages, system_prompt, tools):
-        self.received_messages = list(messages)
-        self.received_system_prompt = system_prompt
-        self.received_tools = list(tools)
-        self.requests.append(
-            {
-                "messages": list(messages),
-                "system_prompt": system_prompt,
-                "tools": list(tools),
-            }
-        )
+    async def stream(self, request):
+        self.received_messages = list(request.messages)
+        self.received_system_prompt = request.system
+        self.received_tools = list(request.tools)
+        self.requests.append(request)
 
         if self.error:
             raise self.error
         if self.responses:
             response = self.responses.pop(0)
-            if isinstance(response, ProviderError):
+            if isinstance(response, LLMError):
                 raise response
             for event in response:
                 yield event
@@ -60,8 +54,8 @@ class FakeProvider(BaseProvider):
             if self.delay:
                 await asyncio.sleep(self.delay)
             reply += chunk
-            yield ProviderEvent(type="text_delta", text=chunk)
-        yield ProviderEvent(
+            yield LLMEvent(type="text_delta", text=chunk)
+        yield LLMEvent(
             type="completed",
             message=ChatMessage(role="assistant", content=reply),
         )

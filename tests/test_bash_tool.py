@@ -10,6 +10,13 @@ def python_command(code: str) -> str:
     return f'"{sys.executable}" -c "{code}"'
 
 
+def test_bash_definition_prefers_dedicated_tools(tmp_path):
+    definition = BashTool(tmp_path).definition()
+
+    assert all(name in definition.description for name in ["Read", "Glob", "Grep"])
+    assert "不要用 shell 拼凑" in definition.description
+
+
 async def test_bash_returns_output_and_exit_code(tmp_path):
     result = await BashTool(tmp_path).execute(
         ToolCall(

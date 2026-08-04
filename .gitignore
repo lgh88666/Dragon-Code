@@ -8,5 +8,6 @@ htmlcov/
 
 # 真实 Provider 配置包含 API Key，禁止提交。
 .dragon-code/config.yaml
+.dragon-code/settings.local.yaml
 .env
 .env.*

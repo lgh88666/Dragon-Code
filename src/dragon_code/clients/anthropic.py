@@ -5,18 +5,19 @@ import json
 
 from anthropic import AsyncAnthropic
 
+from dragon_code.clients.base import LLMClient, make_llm_error
 from dragon_code.models import (
     ChatMessage,
+    LLMEvent,
+    LLMRequest,
     ProviderConfig,
-    ProviderEvent,
     TokenUsage,
     ToolCall,
     ToolDefinition,
 )
-from dragon_code.providers.base import BaseProvider, make_provider_error
 
 
-class AnthropicProvider(BaseProvider):
+class AnthropicClient(LLMClient):
     """把 Anthropic SDK 的流式响应转换为正文字符串。"""
 
     def __init__(self, config: ProviderConfig):
@@ -27,7 +28,11 @@ class AnthropicProvider(BaseProvider):
             client_args["base_url"] = config.base_url
         self._client = AsyncAnthropic(**client_args)
 
-    def _build_messages(self, messages: list[ChatMessage]) -> list[dict]:
+    def _build_messages(
+        self,
+        messages: list[ChatMessage],
+        reminder: str | None = None,
+    ) -> list[dict]:
         """把项目内部消息转换为 Anthropic 消息。"""
 
         result = []
@@ -64,7 +69,26 @@ class AnthropicProvider(BaseProvider):
                 result.append({"role": "assistant", "content": content})
                 continue
             result.append({"role": item.role, "content": item.content})
+        if reminder:
+            self._append_reminder(result, reminder)
         return result
+
+    @staticmethod
+    def _append_reminder(messages: list[dict], reminder: str) -> None:
+        """只修改协议副本，并保证 tool_result 位于提醒之前。"""
+
+        reminder_block = {"type": "text", "text": reminder}
+        if not messages or messages[-1]["role"] != "user":
+            messages.append({"role": "user", "content": [reminder_block]})
+            return
+
+        content = messages[-1]["content"]
+        if isinstance(content, str):
+            content = [{"type": "text", "text": content}]
+        else:
+            content = list(content)
+        content.append(reminder_block)
+        messages[-1]["content"] = content
 
     def _build_tools(self, tools: list[ToolDefinition]) -> list[dict]:
         return [
@@ -76,35 +100,38 @@ class AnthropicProvider(BaseProvider):
             for tool in tools
         ]
 
-    def _build_request(
-        self,
-        messages: list[ChatMessage],
-        system_prompt: str,
-        tools: list[ToolDefinition],
-    ) -> dict:
+    def _build_request(self, llm_request: LLMRequest) -> dict:
         """组装 Anthropic Messages 请求参数。"""
 
         request = {
             "model": self.model,
             "max_tokens": 4096,
-            "system": system_prompt,
-            "messages": self._build_messages(messages),
-            "tools": self._build_tools(tools),
+            "system": [
+                {
+                    "type": "text",
+                    "text": llm_request.system.stable,
+                    "cache_control": {"type": "ephemeral"},
+                },
+                {
+                    "type": "text",
+                    "text": llm_request.system.environment,
+                },
+            ],
+            "messages": self._build_messages(
+                llm_request.messages,
+                llm_request.reminder,
+            ),
+            "tools": self._build_tools(llm_request.tools),
         }
         if self.config.thinking:
             # 思考预算必须小于 max_tokens，否则 Anthropic 会拒绝请求。
             request["thinking"] = {"type": "enabled", "budget_tokens": 2048}
         return request
 
-    async def stream(
-        self,
-        messages: list[ChatMessage],
-        system_prompt: str,
-        tools: list[ToolDefinition],
-    ):
+    async def stream(self, llm_request: LLMRequest):
         """将 Anthropic 内容块转换为统一事件。"""
 
-        request = self._build_request(messages, system_prompt, tools)
+        request = self._build_request(llm_request)
         try:
             async with self._client.messages.stream(**request) as response:
                 reply_parts: list[str] = []
@@ -116,6 +143,12 @@ class AnthropicProvider(BaseProvider):
                     if event.type == "message_start":
                         message_usage = getattr(event.message, "usage", None)
                         usage.input_tokens = getattr(message_usage, "input_tokens", None)
+                        usage.cache_write_tokens = (
+                            getattr(message_usage, "cache_creation_input_tokens", 0) or 0
+                        )
+                        usage.cache_read_tokens = (
+                            getattr(message_usage, "cache_read_input_tokens", 0) or 0
+                        )
                         continue
                     if event.type == "message_delta":
                         delta_usage = getattr(event, "usage", None)
@@ -123,7 +156,7 @@ class AnthropicProvider(BaseProvider):
                         continue
                     if event.type == "text":
                         reply_parts.append(event.text)
-                        yield ProviderEvent(type="text_delta", text=event.text)
+                        yield LLMEvent(type="text_delta", text=event.text)
                         continue
                     if event.type == "content_block_start":
                         block = event.content_block
@@ -188,7 +221,7 @@ class AnthropicProvider(BaseProvider):
                         parse_error=parse_error,
                     )
                     calls.append(call)
-                    yield ProviderEvent(type="tool_call", tool_call=call)
+                    yield LLMEvent(type="tool_call", tool_call=call)
 
                 message = ChatMessage(
                     role="assistant",
@@ -196,12 +229,12 @@ class AnthropicProvider(BaseProvider):
                     tool_calls=calls,
                     hidden_blocks=hidden_blocks,
                 )
-                yield ProviderEvent(type="usage", usage=usage)
-                yield ProviderEvent(type="completed", message=message)
+                yield LLMEvent(type="usage", usage=usage)
+                yield LLMEvent(type="completed", message=message)
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            raise make_provider_error(error) from error
+            raise make_llm_error(error) from error
 
     @staticmethod
     def _block_to_dict(block) -> dict:

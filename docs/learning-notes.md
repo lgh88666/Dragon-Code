@@ -452,6 +452,88 @@ OSC 52 继续交给外层终端。后台分离的 tmux 没有外层终端客户�
 > Ctrl+C 设计成条件动作，有选择就通过 OSC 52 复制，没有选择就安全退出。测试不仅断言
 > 剪贴板内容，还在 WSL/tmux 中发送真实鼠标序列验证了复制、继续对话和退出三条路径。
 
+## ch05：系统提示工程化
+
+### 一个 system 字段，两个内容块
+
+Anthropic 请求并不是发送两个同名的 `system` 字段，而是发送一个 `system` 字段，字段值
+是内容块列表：
+
+```text
+system
+├── system[0]：稳定系统提示，带 cache_control
+└── system[1]：动态环境信息，不带 cache_control
+```
+
+稳定块包含七个固定模块：身份、系统约束、任务模式、动作执行、工具使用、语气风格和文本
+输出。环境块包含工作目录、平台、日期、Git 摘要、版本和模型。
+
+### Anthropic 缓存顺序
+
+Anthropic 计算提示前缀的顺序固定为：
+
+```text
+tools → system → messages
+```
+
+因此把显式缓存断点放在稳定的 `system[0]` 末尾，就会同时覆盖全部工具定义和稳定系统
+提示；位于断点之后的环境、补充提醒和对话历史不会进入这段稳定缓存。
+
+缓存能否命中有三个条件：
+
+1. 工具定义和稳定提示的内容、顺序逐字一致。
+2. 稳定前缀达到当前模型规定的最小 Token 门槛。
+3. 请求发生在缓存 TTL 内，且端点真正支持并暴露缓存字段。
+
+### system-reminder 为什么不写入历史
+
+Plan Mode 等运行时约束会随 Agent Loop 轮次变化。如果把它拼进稳定系统提示，会让缓存
+前缀不断变化；如果写入 Conversation，又会污染后续对话。
+
+Dragon Code 把 reminder 独立放在 `LLMRequest` 中，只在 LLM Client 序列化本轮请求时
+注入带 `<system-reminder>` 标签的临时内容。Anthropic 的 `tool_result` 必须排在 reminder
+之前，避免破坏 tool use/result 配对。
+
+Plan Mode 第 `1、6、11……` 轮使用完整提醒，其他轮使用精简提醒；默认模式不注入。
+
+### 统一请求的作用
+
+```text
+Agent
+  ↓ LLMRequest(messages, tools, system, reminder)
+LLM Client
+  ├── Anthropic：system 内容块 + 显式缓存
+  └── OpenAI：稳定 system 前缀 + 自动缓存字段解析
+```
+
+Agent 不需要知道 `cache_control` 或 `prompt_tokens_details`。协议字段只存在于具体
+LLM Client 中，统一用量对象最终暴露输入、输出、缓存写入、缓存读取四项。
+
+### 测试与证据
+
+- 自动化测试：`115 passed, 1 skipped`。
+- Ruff 格式与 lint 全部通过。
+- tmux 真实 DeepSeek：模型按要求优先调用 Read，并正确总结 ch05 Spec。
+- Plan Mode 真实调用只出现 Glob；`/do` 后自动完成 Write → Read 验证。
+- 取消慢 Bash 后历史保持合法，下一条消息正常返回 `OK`。
+- 使用全新缓存标记烟测：第一次输入 1358、缓存读取 0；第二次输入 78、缓存读取 1280。
+  当前 DeepSeek 兼容端点没有暴露缓存写入字段，但第二次读取量证明稳定前缀已被复用。
+
+### 踩坑记录
+
+- 在 WSL tmux 中运行 Windows `uv.exe` 时，tmux 的 `Escape` 名称没有被转发为 Textual
+  识别的取消键，发送等价控制码 `C-[` 后取消成功。这是测试链路的按键表示差异，不是
+  Agent 取消逻辑失败。
+- 真正的缓存烟测可能一开始就读到之前 TUI 请求创建的缓存；为观察新前缀，烟测脚本提供
+  固定 `--cache-tag`，两次测试请求使用同一个新标记，正式 Agent 不使用该标记。
+
+### 面试表达
+
+> 我把系统提示重构成稳定模块、动态环境和临时提醒三层。Agent 只构造协议无关的
+> LLMRequest，Anthropic Client 用一个 system 字段内的两个内容块设置显式缓存断点，
+> OpenAI Client 保持稳定前缀。Plan Mode 约束通过不持久化的 system-reminder 按轮注入，
+> 既不污染历史，也不会破坏工具结果配对。最后通过真实缓存读取 Token 验证了前缀复用。
+
 ## 每章源码回顾模板
 
 ### chXX：[模块名称]

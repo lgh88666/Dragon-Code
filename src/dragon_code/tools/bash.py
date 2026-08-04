@@ -12,13 +12,17 @@ MAX_COMMAND_OUTPUT = 100_000
 
 
 class BashArguments(BaseModel):
-    command: str = Field(description="要在项目工作目录执行的完整 shell 命令。")
+    command: str = Field(
+        description="确实需要系统 shell 时执行的完整命令；不要用它替代专用文件工具。"
+    )
 
 
 class BashTool(Tool):
     name = "Bash"
     description = (
         "在 Dragon Code 启动目录使用系统默认 shell 执行命令。"
+        "读取文件优先使用 Read，查找文件优先使用 Glob，搜索内容优先使用 Grep。"
+        "不要用 shell 拼凑专用工具已经能完成的操作。"
         "返回 stdout、stderr 和退出码；命令可能修改系统，应谨慎使用。"
     )
     category = "command"
