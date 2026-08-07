@@ -35,5 +35,15 @@
 
 ## Git
 
-- [ ] 本次文档已创建本地提交。（验证：`git log -1 --oneline`）(AC7)
+- [x] 本次文档已创建本地提交。（验证：`3469095 docs: record project workflow and handoff`）(AC7)
 - [x] 未自动推送 GitHub。（验证：本地提交完成后等待用户明确指令）(AC7)
+
+## 实际验收记录
+
+- 日期：2026-08-07。
+- 文件：六个目标文档全部存在。
+- 占位符：稳定规则、交接、spec 和 plan 中无真实 TBD/TODO。
+- 安全扫描：无真实 API Key、长 Bearer Token 或用户邮箱。
+- Git 检查：`git diff --cached --check` 通过，`.idea/` 和 `321.txt` 未提交。
+- 本地提交：`3469095 docs: record project workflow and handoff`。
+- 远端状态：未执行 push，等待用户明确授权。
