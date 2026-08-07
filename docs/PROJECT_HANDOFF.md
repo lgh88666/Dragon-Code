@@ -1,0 +1,241 @@
+# Dragon Code 项目交接
+
+> 这是会随章节进度更新的动态交接文档。长期协作规则以根目录 `AGENTS.md` 为准。
+
+## 项目定位
+
+- 项目：Dragon Code
+- 仓库：<https://github.com/lgh88666/Dragon-Code>
+- 主分支：`master`
+- 语言：Python 3.12+
+- 界面：Textual TUI
+- 依赖管理：uv
+- 目标：从零构建类似 Claude Code 的终端 AI 编程助手，用于秋招展示和源码学习。
+- 教材中的 MewCode 在本项目中统一对应 Dragon Code。
+
+## 当前状态
+
+- 已完成：ch02–ch07。
+- 最近完成模块：ch07 MCP 客户端。
+- ch07 实现提交：`9b0d901 feat: add MCP client integration`。
+- 当前功能代码已经推送到 GitHub。
+- 当前交接工作只增加协作规则与项目状态文档，不修改产品功能。
+- 下一开发章节：ch08 上下文管理。
+- 开始 ch08 前，应先完成相应理论学习和需求澄清，不能直接写代码。
+
+## 已有能力
+
+### ch02：多协议 LLM 终端对话
+
+- Anthropic 与 OpenAI/兼容端点。
+- YAML Provider 配置与启动选择。
+- 流式文本、计时、Markdown 定型和多轮历史。
+- Textual TUI、Dragon Banner、错误恢复与安全退出。
+
+### ch03：工具系统
+
+- Read、Write、Edit、Bash、Glob、Grep 六个内置工具。
+- 统一 Tool 接口、ToolRegistry、参数 Schema、超时和结构化错误。
+- Anthropic/OpenAI 流式工具调用解析与 ToolResult 回灌。
+
+### ch04：Agent Loop
+
+- ReAct 多轮循环，直到模型自然完成或触发停止条件。
+- AgentEvent 异步事件流，Agent 与 TUI 解耦。
+- 文本实时显示和完整响应收集双路处理。
+- 连续只读工具并发、有副作用工具串行。
+- `/plan` 与 `/do` 两段式 Plan Mode。
+
+### ch05：系统提示工程化
+
+- 七个稳定系统提示模块与动态环境信息。
+- Anthropic 显式提示缓存、OpenAI 稳定前缀。
+- system-reminder 动态注入，不污染历史。
+- Token 用量和缓存读取/写入统计。
+
+### ch06：权限系统
+
+- 危险命令黑名单、路径沙箱、三级规则、权限模式和 HITL 五层防御。
+- default、acceptEdits、plan、bypassPermissions 四种模式。
+- 本次允许、永久精确允许和拒绝。
+- 权限拒绝作为工具结果返回，Agent Loop 可以调整策略。
+
+### ch07：MCP 客户端
+
+- MCP Python SDK v2。
+- stdio 与 Streamable HTTP 两种传输。
+- 用户级与项目级 Server 配置合并及 `${VAR}` 展开。
+- 启动时并发连接、分页发现、命名隔离和连接复用。
+- MCP 工具统一适配成现有 Tool，完整名称为 `mcp__server__tool`。
+- 首次、本会话、永久和拒绝四项 MCP 权限。
+- 单 Server 失败隔离、结果截断和退出生命周期清理。
+
+## 当前核心调用链
+
+```text
+CLI 加载 Provider、权限和 MCP 配置
+  ↓
+McpManager 连接 Server、发现工具并注册到 ToolRegistry
+  ↓
+Textual TUI 接收用户输入
+  ↓
+Agent 构造 LLMRequest（系统提示、环境、历史、工具定义）
+  ↓
+AnthropicClient / OpenAIClient 流式返回统一事件
+  ↓
+Agent 判断是否存在 ToolCall
+  ↓
+PermissionEngine 检查黑名单、沙箱、规则、模式和用户审批
+  ↓
+ToolScheduler → ToolRegistry → 内置 Tool 或 McpTool
+  ↓
+ToolResult 写回 Conversation
+  ↓
+Agent 进入下一轮，直到最终文本或停止条件
+  ↓
+TUI 通过 AgentEvent 实时展示文本、工具行、结果和状态
+```
+
+## 核心源码入口
+
+| 文件 | 当前职责 |
+|---|---|
+| `src/dragon_code/cli.py` | 加载配置，装配 Registry、MCP Manager 和 TUI，统一清理 |
+| `src/dragon_code/tui.py` | 终端布局、输入、事件消费、权限弹窗和状态展示 |
+| `src/dragon_code/agent.py` | Agent Loop、模式、权限等待、工具执行和事件输出 |
+| `src/dragon_code/models.py` | 消息、请求、事件、工具调用和用量等统一模型 |
+| `src/dragon_code/clients/base.py` | 协议无关 LLMClient 接口 |
+| `src/dragon_code/clients/anthropic.py` | Anthropic 请求、缓存和流事件适配 |
+| `src/dragon_code/clients/openai.py` | OpenAI/兼容端点请求和流事件适配 |
+| `src/dragon_code/stream_collector.py` | 流式实时转发与完整响应收集 |
+| `src/dragon_code/tool_scheduler.py` | 工具调用的保序分批和并发调度 |
+| `src/dragon_code/tools/registry.py` | 内置工具与 MCP 工具的统一注册和执行入口 |
+| `src/dragon_code/permissions/engine.py` | 五层权限判断和 MCP 会话授权 |
+| `src/dragon_code/prompt.py` | 模块化系统提示、环境信息、reminder 和 Banner |
+| `src/dragon_code/mcp/config.py` | MCP 两层配置、校验和变量展开 |
+| `src/dragon_code/mcp/manager.py` | MCP 连接、发现、隔离、缓存和关闭 |
+| `src/dragon_code/mcp/tool.py` | 远端 MCP Tool 到 Dragon Code Tool 的适配 |
+
+## 最近验证状态
+
+ch07 完成时的证据：
+
+- `uv sync --locked`：通过。
+- `uv run ruff format --check .`：通过。
+- `uv run ruff check .`：通过。
+- `uv run pytest -q`：`226 passed, 2 skipped`。
+- tmux + 真实 DeepSeek：成功调用 `mcp__local_test__echo(text=dragon)`。
+- TUI 显示四项 MCP 权限菜单，ToolResult 回灌后模型最终回答包含 `dragon`。
+- “本会话允许”后，相同 MCP 工具再次调用不弹窗。
+- `/plan` 只制定计划；`/do` 恢复 MCP 并执行 `plan-dragon`。
+- 一个无效 Server 与正常 Server 并存时，正常工具仍返回 `isolation-ok`。
+- `/exit` 后没有残留 `mcp_test_server.py` 子进程。
+
+完整证据见 `specs/ch07-mcp-client/acceptance-report.md`。
+
+## 学习与回顾状态
+
+- `docs/learning-notes.md` 已系统整理 ch02、ch03、聊天历史复制和 ch05。
+- ch06 已进行过对话式核心回顾，但尚未整理成独立的完整学习笔记章节。
+- ch07 功能已经开发和验收，核心源码回顾与学习笔记仍待进行。
+- 后续回顾只聚焦核心调用链、关键类型、边界、测试和面试表达，不逐文件啃完所有源码。
+- 用户说“记一下”时，应立即把对应知识补入 `docs/learning-notes.md`。
+
+## 不通过 Git 同步的内容
+
+以下内容必须在新电脑重新配置，不能提交到仓库：
+
+- `.dragon-code/config.yaml` 中的 Provider API Key。
+- `.dragon-code/settings.local.yaml` 中的本地权限选择。
+- `.env` 和任何真实 Token。
+- 用户级 `~/.dragon-code/config.yaml` 与 `~/.dragon-code/settings.yaml`。
+- 本机安装的 MCP Server、命令路径和环境变量。
+- 飞书账号登录态和浏览器会话。
+- Codex 本地应用偏好、未上传附件和未进入 Git 的聊天内容。
+
+## 新电脑继续开发
+
+### 1. 获取代码
+
+首次克隆：
+
+```powershell
+git clone https://github.com/lgh88666/Dragon-Code.git
+cd Dragon-Code
+```
+
+已经克隆过：
+
+```powershell
+git pull origin master
+```
+
+### 2. 安装依赖
+
+```powershell
+uv sync --locked
+```
+
+### 3. 重建本地配置
+
+```powershell
+Copy-Item .dragon-code/config.yaml.example .dragon-code/config.yaml
+```
+
+然后只在本地填写 Provider API Key、模型、base_url 和需要的 MCP Server。确认该文件仍被 `.gitignore` 忽略。
+
+### 4. 启动验证
+
+```powershell
+uv run dragon-code
+```
+
+也可以使用：
+
+```powershell
+uv run python -m dragon_code
+```
+
+### 5. 在新 Codex 聊天中恢复上下文
+
+打开仓库根目录后，发送：
+
+```text
+请先阅读 AGENTS.md 和 docs/PROJECT_HANDOFF.md，再查看 git status。
+继续 Dragon Code 项目，严格遵守仓库记录的 Spec 开发模式。
+```
+
+即使原聊天没有同步，新 Agent 也应从仓库恢复长期规则和当前状态。
+
+## 下一步
+
+推荐顺序：
+
+1. 回顾 ch07 核心源码：`mcp/config.py → manager.py → tool.py → cli.py → permission/TUI`。
+2. 将 ch06/ch07 值得记忆的内容补入 `docs/learning-notes.md`。
+3. 学习教材 ch08 Python 理论部分。
+4. 按 `AGENTS.md` 的四文档流程启动 ch08 上下文管理开发。
+
+## 每章验收后的更新模板
+
+每章完成时更新本文件：
+
+```markdown
+### chXX：模块名
+- 新增能力：
+- 明确不做：
+- 核心文件：
+- 自动化证据：
+- tmux 证据：
+- 核心源码回顾状态：
+- 学习笔记状态：
+- 实现提交：
+- 下一步：
+```
+
+同时执行：
+
+1. 更新该章 checklist 和 acceptance report。
+2. 更新本交接文档。
+3. 创建本地 Git commit。
+4. 等用户明确要求后再 push。
