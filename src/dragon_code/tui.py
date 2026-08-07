@@ -37,7 +37,7 @@ from dragon_code.permissions.engine import PermissionEngine
 from dragon_code.permissions.rules import RuleStore
 from dragon_code.prompt import DO_PLAN_PROMPT, render_banner
 from dragon_code.session import Conversation
-from dragon_code.tools import create_default_registry
+from dragon_code.tools import ToolRegistry, create_default_registry
 
 
 def format_tool_call(call: ToolCall) -> str:
@@ -53,7 +53,8 @@ def format_tool_call(call: ToolCall) -> str:
     elif call.name == "Grep":
         key = f"{arguments.get('pattern', '')}, {arguments.get('path', '.')}"
     else:
-        key = ""
+        # MCP 参数结构不固定，显示前几个键值即可。
+        key = ", ".join(f"{name}={value}" for name, value in list(arguments.items())[:3])
     key = str(key).replace("\n", " ")
     if len(key) > 100:
         key = key[:97] + "..."
@@ -171,12 +172,13 @@ class ProviderSelectScreen(ModalScreen[int]):
 
 
 class PermissionApprovalScreen(ModalScreen[ApprovalChoice | None]):
-    """显示一次工具调用的三选一权限确认。"""
+    """显示一次工具调用的权限确认。"""
 
     BINDINGS = [
         Binding("1", "allow_once", show=False, priority=True),
-        Binding("2", "allow_always", show=False, priority=True),
-        Binding("3", "deny_once", show=False, priority=True),
+        Binding("2", "choose_second", show=False, priority=True),
+        Binding("3", "choose_third", show=False, priority=True),
+        Binding("4", "choose_fourth", show=False, priority=True),
         Binding("escape", "cancel", show=False, priority=True),
         Binding("ctrl+c", "cancel", show=False, priority=True),
     ]
@@ -186,16 +188,20 @@ class PermissionApprovalScreen(ModalScreen[ApprovalChoice | None]):
         self.request = request
 
     def compose(self) -> ComposeResult:
+        labels = ["1. 允许本次"]
+        if self._is_mcp_request():
+            labels.append("2. 本会话允许该 MCP 工具")
+            labels.append("3. 永久允许该 MCP 工具")
+            labels.append("4. 拒绝本次")
+        else:
+            labels.append("2. 永久允许此精确调用")
+            labels.append("3. 拒绝本次")
+
         with Vertical(id="permission-dialog"):
             yield Static("需要你的允许", id="permission-title")
             yield Static(self.request.summary, id="permission-summary")
             yield Static(self.request.reason, id="permission-reason")
-            yield OptionList(
-                "1. 允许本次",
-                "2. 永久允许此精确调用",
-                "3. 拒绝本次",
-                id="permission-options",
-            )
+            yield OptionList(*labels, id="permission-options")
 
     def on_mount(self) -> None:
         options = self.query_one("#permission-options", OptionList)
@@ -203,33 +209,48 @@ class PermissionApprovalScreen(ModalScreen[ApprovalChoice | None]):
         options.focus()
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
-        choices = [
-            ApprovalChoice.ALLOW_ONCE,
-            ApprovalChoice.ALLOW_ALWAYS,
-            ApprovalChoice.DENY_ONCE,
-        ]
-        self.dismiss(choices[event.option_index])
+        self.dismiss(self._choices()[event.option_index])
 
     def action_allow_once(self) -> None:
         self.dismiss(ApprovalChoice.ALLOW_ONCE)
 
-    def action_allow_always(self) -> None:
-        self.dismiss(ApprovalChoice.ALLOW_ALWAYS)
+    def action_choose_second(self) -> None:
+        self._dismiss_index(1)
 
-    def action_deny_once(self) -> None:
-        self.dismiss(ApprovalChoice.DENY_ONCE)
+    def action_choose_third(self) -> None:
+        self._dismiss_index(2)
+
+    def action_choose_fourth(self) -> None:
+        self._dismiss_index(3)
 
     def action_cancel(self) -> None:
         self.dismiss(None)
 
     def submit_highlighted(self) -> None:
         options = self.query_one("#permission-options", OptionList)
-        choices = [
+        self.dismiss(self._choices()[options.highlighted or 0])
+
+    def _is_mcp_request(self) -> bool:
+        return self.request.call.name.startswith("mcp__")
+
+    def _choices(self) -> list[ApprovalChoice]:
+        if self._is_mcp_request():
+            return [
+                ApprovalChoice.ALLOW_ONCE,
+                ApprovalChoice.ALLOW_SESSION,
+                ApprovalChoice.ALLOW_ALWAYS,
+                ApprovalChoice.DENY_ONCE,
+            ]
+        return [
             ApprovalChoice.ALLOW_ONCE,
             ApprovalChoice.ALLOW_ALWAYS,
             ApprovalChoice.DENY_ONCE,
         ]
-        self.dismiss(choices[options.highlighted or 0])
+
+    def _dismiss_index(self, index: int) -> None:
+        choices = self._choices()
+        if index < len(choices):
+            self.dismiss(choices[index])
 
 
 class DragonCodeApp(App):
@@ -246,10 +267,12 @@ class DragonCodeApp(App):
     def __init__(
         self,
         config: AppConfig,
+        registry: ToolRegistry | None = None,
         client_factory: Callable[[ProviderConfig], LLMClient] = create_llm_client,
     ):
         super().__init__()
         self.config = config
+        self.registry = registry or create_default_registry(Path.cwd())
         self.client_factory = client_factory
         self.session_state = SessionState.SELECTING
         self.client: LLMClient | None = None
@@ -312,7 +335,7 @@ class DragonCodeApp(App):
         self.agent = Agent(
             self.client,
             Conversation(),
-            create_default_registry(workdir),
+            self.registry,
             workdir,
             __version__,
             permission_engine=PermissionEngine(workdir, rule_store),
@@ -685,9 +708,11 @@ class DragonCodeApp(App):
             ("  1               ", "cyan"),
             ("允许本次\n", "dim"),
             ("  2               ", "cyan"),
-            ("永久允许此精确调用\n", "dim"),
+            ("MCP：本会话允许；内置工具：永久允许\n", "dim"),
             ("  3               ", "cyan"),
-            ("拒绝本次\n", "dim"),
+            ("MCP：永久允许；内置工具：拒绝本次\n", "dim"),
+            ("  4               ", "cyan"),
+            ("MCP 工具拒绝本次\n", "dim"),
             ("\n工具（Default Mode）：\n", "bold cyan"),
             ("  Read Write Edit Bash Glob Grep\n", "dim"),
             ("\n工具（Plan Mode）：\n", "bold cyan"),

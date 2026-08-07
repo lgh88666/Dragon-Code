@@ -254,6 +254,25 @@ async def test_permanent_allow_saves_rule_and_applies_immediately(tmp_path):
     assert (tmp_path / "saved.txt").read_text(encoding="utf-8") == "two"
 
 
+async def test_mcp_allow_session_only_asks_once(tmp_path):
+    mcp_tool = DemoTool(name="mcp__local__echo", safe=True)
+    first = ToolCall("mcp-1", mcp_tool.name, {"text": "one"})
+    second = ToolCall("mcp-2", mcp_tool.name, {"text": "two"})
+    client = SequenceClient([response(calls=[first]), response(calls=[second]), response("完成")])
+    agent = make_agent(
+        client,
+        registry=registry_with(mcp_tool),
+        working_dir=tmp_path,
+        permission_engine=permission_engine(tmp_path),
+    )
+
+    events = await collect_with_approval(agent, ApprovalChoice.ALLOW_SESSION)
+
+    assert [event.type for event in events].count("permission_request") == 1
+    assert mcp_tool.calls == ["mcp-1", "mcp-2"]
+    assert not (tmp_path / ".dragon-code/settings.local.yaml").exists()
+
+
 async def test_permanent_save_failure_falls_back_to_allow_once(tmp_path, monkeypatch):
     from dragon_code.tools.file_tools import WriteTool
 

@@ -17,6 +17,13 @@ class DemoTool(Tool):
     arguments_model = EmptyArguments
 
 
+class DemoMcpTool(DemoTool):
+    name = "mcp__local__echo"
+    category = "mcp"
+    read_only = True
+    is_concurrency_safe = True
+
+
 def engine(tmp_path):
     return PermissionEngine(
         tmp_path,
@@ -32,6 +39,48 @@ def test_unknown_tool_and_invalid_arguments_are_denied(tmp_path):
     assert unknown.decision is PermissionDecision.DENY
     assert unknown.source == "unknown_tool"
     assert invalid.source == "invalid_arguments"
+
+
+def test_mcp_first_use_asks_in_every_mode(tmp_path):
+    permission = engine(tmp_path)
+    tool = DemoMcpTool()
+    tool_call = ToolCall("1", tool.name, {"text": "dragon"})
+
+    for mode in PermissionMode:
+        result = permission.check(tool_call, tool, mode)
+        assert result.decision is PermissionDecision.ASK
+        assert result.source == "mcp_first_use"
+
+
+def test_mcp_session_allow_does_not_override_deny_rule(tmp_path):
+    settings = tmp_path / ".dragon-code/settings.local.yaml"
+    settings.parent.mkdir(parents=True)
+    settings.write_text(
+        "permissions:\n  deny:\n    - mcp__local__echo\n",
+        encoding="utf-8",
+    )
+    permission = engine(tmp_path)
+    tool = DemoMcpTool()
+    tool_call = ToolCall("1", tool.name, {"text": "dragon"})
+
+    permission.allow_for_session(tool.name)
+    result = permission.check(tool_call, tool, PermissionMode.BYPASS_PERMISSIONS)
+
+    assert result.decision is PermissionDecision.DENY
+    assert result.source == "local_rule"
+
+
+def test_mcp_session_allow_applies_until_new_engine(tmp_path):
+    permission = engine(tmp_path)
+    tool = DemoMcpTool()
+    tool_call = ToolCall("1", tool.name, {"text": "dragon"})
+
+    permission.allow_for_session(tool.name)
+
+    assert permission.check(tool_call, tool, PermissionMode.DEFAULT).source == "session"
+    assert engine(tmp_path).check(tool_call, tool, PermissionMode.DEFAULT).decision is (
+        PermissionDecision.ASK
+    )
 
 
 def test_blacklist_cannot_be_bypassed(tmp_path):

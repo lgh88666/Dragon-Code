@@ -22,6 +22,7 @@ from dragon_code.models import (
 )
 from dragon_code.permissions import ApprovalChoice, PermissionMode, PermissionRequest
 from dragon_code.prompt import DO_PLAN_PROMPT
+from dragon_code.tools import create_default_registry
 from dragon_code.tui import (
     DragonCodeApp,
     MessageInput,
@@ -310,6 +311,41 @@ async def test_permission_screen_defaults_to_allow_once_and_accepts_enter():
         await pilot.press("down", "enter")
         await pilot.pause()
         assert selected == [ApprovalChoice.ALLOW_ALWAYS]
+
+
+async def test_mcp_permission_screen_has_session_choice():
+    app = app_with_client(FakeClient())
+    selected = []
+    call = ToolCall("mcp-1", "mcp__local__echo", {"text": "dragon"})
+    request = PermissionRequest(call, "MCP 首次使用", "echo(text=dragon)", call.name)
+
+    async with app.run_test(size=(90, 30)) as pilot:
+        app.session_state = SessionState.APPROVING
+        app.push_screen(PermissionApprovalScreen(request), callback=selected.append)
+        await pilot.pause()
+
+        options = app.screen.query_one("#permission-options", OptionList)
+        assert options.option_count == 4
+        await pilot.press("2")
+        await pilot.pause()
+
+    assert selected == [ApprovalChoice.ALLOW_SESSION]
+
+
+async def test_app_uses_injected_registry(tmp_path):
+    fake_client = FakeClient()
+    config = AppConfig([provider_config(fake_client.name, fake_client.model)])
+    registry = create_default_registry(tmp_path)
+    app = DragonCodeApp(
+        config,
+        registry,
+        client_factory=lambda _config: fake_client,
+    )
+
+    async with app.run_test(size=(90, 30)) as pilot:
+        await pilot.pause()
+        assert app.agent is not None
+        assert app.agent.registry is registry
 
 
 async def test_shift_tab_cycles_permission_modes_and_updates_status():

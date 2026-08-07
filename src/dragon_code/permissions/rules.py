@@ -20,6 +20,7 @@ from dragon_code.permissions.models import (
 TOOL_NAMES = {"Bash", "Read", "Write", "Edit", "Glob", "Grep"}
 FILE_TOOLS = {"Read", "Write", "Edit", "Glob", "Grep"}
 SPECIAL_PATTERN_CHARS = {"*", "?", "[", "]", "\\"}
+MCP_TOOL_NAME_PATTERN = re.compile(r"^mcp__[A-Za-z0-9_-]+__[A-Za-z0-9_-]+$")
 
 
 class RuleParseError(ValueError):
@@ -45,8 +46,10 @@ def parse_rule(raw: str, decision: PermissionDecision) -> PermissionRule:
         if not pattern:
             raise RuleParseError("权限规则的匹配模式不能为空。")
 
-    if tool_name not in TOOL_NAMES:
+    if not is_supported_tool_name(tool_name):
         raise RuleParseError(f"未知工具规则：{tool_name}")
+    if is_mcp_tool_name(tool_name) and pattern is not None:
+        raise RuleParseError("MCP 权限规则只支持完整工具名，不支持参数模式。")
 
     return PermissionRule(
         tool_name=tool_name,
@@ -54,6 +57,16 @@ def parse_rule(raw: str, decision: PermissionDecision) -> PermissionRule:
         decision=decision,
         raw=text,
     )
+
+
+def is_mcp_tool_name(tool_name: str) -> bool:
+    """判断是否为带完整 Server 命名空间的 MCP 工具。"""
+
+    return MCP_TOOL_NAME_PATTERN.fullmatch(tool_name) is not None
+
+
+def is_supported_tool_name(tool_name: str) -> bool:
+    return tool_name in TOOL_NAMES or is_mcp_tool_name(tool_name)
 
 
 def _escape_exact(value: str) -> str:
@@ -94,6 +107,9 @@ def make_exact_rule(call: ToolCall, project_root: Path) -> str:
         value = _relative_path(project_root, raw_path) if isinstance(raw_path, str) else None
     elif call.name == "Glob":
         value = call.arguments.get("pattern")
+    elif is_mcp_tool_name(call.name):
+        # MCP 参数 Schema 不固定，永久权限按完整工具名保存。
+        return call.name
     else:
         raise RuleParseError(f"无法为未知工具生成权限规则：{call.name}")
 

@@ -13,3 +13,17 @@ providers:
     base_url: "https://api.openai.com/v1"
     # OpenAI Chat Completions 首版不会使用 thinking 配置。
     thinking: false
+
+# MCP Server 可以只配置 stdio，也可以同时配置多个 Server。
+mcp_servers:
+  local_test:
+    type: "stdio"
+    command: "uv"
+    args: ["run", "python", "tests/fixtures/mcp_test_server.py"]
+
+  # 远程 Streamable HTTP 示例。使用前取消注释，并在宿主环境设置 MCP_HTTP_TOKEN。
+  # remote_demo:
+  #   type: "http"
+  #   url: "https://example.com/mcp"
+  #   headers:
+  #     Authorization: "Bearer ${MCP_HTTP_TOKEN}"

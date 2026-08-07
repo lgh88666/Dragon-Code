@@ -2,7 +2,7 @@
 
 Dragon Code 是一个使用 Python 构建的、Claude Code 风格终端 AI 编程助手。
 
-当前已完成 ch02–ch06 的核心能力：
+当前已完成 ch02–ch07 的核心能力：
 
 - Anthropic 与 OpenAI Chat Completions 两种协议
 - OpenAI 兼容端点
@@ -16,8 +16,10 @@ Dragon Code 是一个使用 Python 构建的、Claude Code 风格终端 AI 编�
 - `/plan` 与 `/do` 两段式 Plan Mode
 - 模块化 System Prompt、system-reminder 与提示缓存统计
 - 黑名单、路径沙箱、三级规则、权限模式和 HITL 五层权限系统
+- stdio 与 Streamable HTTP 两种 MCP 传输
+- 启动期 MCP 工具自动发现、命名隔离和连接复用
 
-当前仍不包含 MCP、网络访问限制、资源配额和审计日志。
+当前仍不包含 MCP Resources/Prompts、自动重连、网络访问限制、资源配额和审计日志。
 
 ## 环境要求
 
@@ -71,6 +73,39 @@ providers:
 
 `.dragon-code/config.yaml` 已被 Git 忽略。不要把真实 API Key 写入示例文件、README 或提交记录。
 
+## MCP 配置
+
+MCP Server 写在 `mcp_servers` 中。Dragon Code 会合并用户级
+`~/.dragon-code/config.yaml` 与项目级 `.dragon-code/config.yaml`，项目级同名 Server
+完整覆盖用户级配置。
+
+本地 stdio Server 示例：
+
+```yaml
+mcp_servers:
+  local_test:
+    type: stdio
+    command: uv
+    args: [run, python, tests/fixtures/mcp_test_server.py]
+```
+
+远程 Streamable HTTP Server 示例：
+
+```yaml
+mcp_servers:
+  remote_demo:
+    type: http
+    url: https://example.com/mcp
+    headers:
+      Authorization: "Bearer ${MCP_HTTP_TOKEN}"
+```
+
+只有 `env` 和 `headers` 的值支持 `${VAR}`。变量不存在时只跳过对应 Server，并显示
+不包含凭据的警告。单个 Server 连接失败不会影响其他 MCP Server 和六个内置工具。
+
+成功发现的工具以 `mcp__服务名__工具名` 注册。首次调用 MCP 工具时可以选择：允许本次、
+本会话允许、永久允许或拒绝。Plan Mode 不会向模型提供 MCP 工具，执行 `/do` 后恢复。
+
 ## 运行
 
 ```bash
@@ -108,7 +143,8 @@ uv run python -m dragon_code
 - `plan`：只向模型提供 Read、Glob、Grep。
 - `bypassPermissions`：普通操作自动允许，但黑名单、沙箱和显式 deny 仍生效。
 
-需要确认时可以选择：允许本次、永久允许此精确调用、拒绝本次。永久允许写入项目本地文件 `.dragon-code/settings.local.yaml`，该文件已被 Git 忽略。
+内置工具需要确认时可以选择：允许本次、永久允许此精确调用、拒绝本次。MCP 工具额外支持
+“本会话允许”。永久允许写入项目本地文件 `.dragon-code/settings.local.yaml`，该文件已被 Git 忽略。
 
 规则格式为 `工具名(模式)`：
 
@@ -140,4 +176,4 @@ uv run pytest -q
 ```
 
 最终验收需在 tmux 中启动 Dragon Code，输入真实对话，并逐项核对
-[`specs/ch06-permission-system/checklist.md`](specs/ch06-permission-system/checklist.md)。
+[`specs/ch07-mcp-client/checklist.md`](specs/ch07-mcp-client/checklist.md)。

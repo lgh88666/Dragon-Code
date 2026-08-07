@@ -5,7 +5,7 @@ from pathlib import Path
 from dragon_code.models import ToolCall
 from dragon_code.permissions.blacklist import DangerousCommandGuard
 from dragon_code.permissions.models import PermissionDecision, PermissionMode, PermissionResult
-from dragon_code.permissions.rules import RuleStore
+from dragon_code.permissions.rules import RuleStore, is_mcp_tool_name
 from dragon_code.permissions.sandbox import PathSandbox
 from dragon_code.tools.base import Tool
 
@@ -25,6 +25,13 @@ class PermissionEngine:
         self.rule_store = rule_store
         self.blacklist = blacklist or DangerousCommandGuard()
         self.sandbox = sandbox or PathSandbox(self.project_root)
+        self.session_allowed_tools: set[str] = set()
+
+    def allow_for_session(self, tool_name: str) -> None:
+        """仅记录合法 MCP 工具，关闭当前应用后自然失效。"""
+
+        if is_mcp_tool_name(tool_name):
+            self.session_allowed_tools.add(tool_name)
 
     def check(
         self,
@@ -64,6 +71,19 @@ class PermissionEngine:
         rule_result = self.rule_store.match(call)
         if rule_result is not None:
             return rule_result
+
+        if is_mcp_tool_name(call.name):
+            if call.name in self.session_allowed_tools:
+                return PermissionResult(
+                    PermissionDecision.ALLOW,
+                    "session",
+                    "当前会话已经允许该 MCP 工具。",
+                )
+            return PermissionResult(
+                PermissionDecision.ASK,
+                "mcp_first_use",
+                "MCP 工具首次使用需要你的允许。",
+            )
 
         return self._mode_fallback(tool, mode)
 

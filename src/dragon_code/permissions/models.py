@@ -25,9 +25,10 @@ class PermissionDecision(StrEnum):
 
 
 class ApprovalChoice(StrEnum):
-    """用户在权限确认框中的三个选择。"""
+    """用户在权限确认框中的选择。"""
 
     ALLOW_ONCE = "allow_once"
+    ALLOW_SESSION = "allow_session"
     ALLOW_ALWAYS = "allow_always"
     DENY_ONCE = "deny_once"
 

@@ -321,6 +321,8 @@ class Agent:
                         )
                         results[call_index] = self._permission_denied_result(call, user_denial)
                         continue
+                    if choice is ApprovalChoice.ALLOW_SESSION:
+                        self.permission_engine.allow_for_session(call.name)
                     if choice is ApprovalChoice.ALLOW_ALWAYS:
                         try:
                             if not exact_rule:

@@ -27,6 +27,30 @@ def test_parse_rule_with_and_without_pattern():
     assert git.raw == "Bash(git *)"
 
 
+def test_mcp_rule_uses_complete_tool_name():
+    raw = "mcp__github__create_issue"
+    rule = parse_rule(raw, PermissionDecision.ALLOW)
+    tool_call = call(raw, title="demo")
+
+    assert rule.pattern is None
+    assert rule_matches(rule, tool_call, Path.cwd()) is True
+    assert make_exact_rule(tool_call, Path.cwd()) == raw
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "mcp__missingtool",
+        "mcp__bad.server__tool",
+        "mcp__server__bad.tool",
+        "mcp__server__tool(pattern)",
+    ],
+)
+def test_mcp_rule_rejects_incomplete_or_pattern_form(raw):
+    with pytest.raises(RuleParseError):
+        parse_rule(raw, PermissionDecision.ALLOW)
+
+
 @pytest.mark.parametrize("raw", ["", "Unknown(x)", "Bash(", "Bash()"])
 def test_parse_rule_rejects_invalid_text(raw):
     with pytest.raises(RuleParseError):
