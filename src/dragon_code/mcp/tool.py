@@ -12,7 +12,6 @@ from dragon_code.models import ToolCall, ToolDefinition, ToolResult
 from dragon_code.tools.base import Tool
 
 CALL_TIMEOUT_SECONDS = 30.0
-MAX_RESULT_CHARS = 100_000
 VALID_TOOL_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
@@ -120,7 +119,6 @@ class McpTool(Tool):
             parts.append(f"[本章暂不支持 MCP 结果类型：{names}]")
 
         content = "\n\n".join(part for part in parts if part)
-        content, truncated = _truncate(content)
         metadata = {"server": self.server_name, "remote_tool": self.remote_name}
 
         if result.is_error:
@@ -132,7 +130,6 @@ class McpTool(Tool):
                 error_code="mcp_remote_error",
                 error_message=content or "远端 MCP 工具报告执行失败。",
                 metadata=metadata,
-                truncated=truncated,
             )
 
         if unsupported and not any(isinstance(block, TextContent) for block in result.content):
@@ -145,10 +142,9 @@ class McpTool(Tool):
                     error_code="unsupported_content",
                     error_message=content,
                     metadata=metadata,
-                    truncated=truncated,
                 )
 
-        return self._success(call, content, metadata=metadata, truncated=truncated)
+        return self._success(call, content, metadata=metadata)
 
 
 def adapt_tool(
@@ -180,10 +176,3 @@ def adapt_tool(
         read_only=read_only,
         caller=caller,
     )
-
-
-def _truncate(content: str) -> tuple[str, bool]:
-    if len(content) <= MAX_RESULT_CHARS:
-        return content, False
-    marker = "\n[truncated]"
-    return content[: MAX_RESULT_CHARS - len(marker)] + marker, True

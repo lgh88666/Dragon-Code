@@ -15,13 +15,12 @@
 
 ## 当前状态
 
-- 已完成：ch02–ch07。
-- 最近完成模块：ch07 MCP 客户端。
+- 已完成：ch02–ch08。
+- 最近完成模块：ch08 上下文管理。
 - ch07 实现提交：`9b0d901 feat: add MCP client integration`。
 - 当前功能代码已经推送到 GitHub。
-- 当前交接工作只增加协作规则与项目状态文档，不修改产品功能。
-- 下一开发章节：ch08 上下文管理。
-- 开始 ch08 前，应先完成相应理论学习和需求澄清，不能直接写代码。
+- ch08 实现与文档位于同一完成提交；未推送前只存在于本机。
+- 下一开发章节开始前，继续执行理论学习与四文档审批硬门槛。
 
 ## 已有能力
 
@@ -70,6 +69,16 @@
 - 首次、本会话、永久和拒绝四项 MCP 权限。
 - 单 Server 失败隔离、结果截断和退出生命周期清理。
 
+### ch08：上下文管理
+
+- 所有内置工具和MCP工具返回完整结果，由ContextManager统一决定是否落盘。
+- 单条超过50000字节、同轮剩余合计超过200000字节时保存到会话目录并生成稳定预览。
+- Read 支持 `offset`/`limit` 行分页，可按段恢复大型落盘结果。
+- 基于最近一次主请求usage和字符增量估算Token，不引入精确tokenizer。
+- 接近窗口时使用九部分结构化摘要、固定边界提示和近期原文替换旧历史。
+- 主模型和摘要模型使用同协议、Key、base_url的独立Client；本机摘要模型为 `deepseek-v4-flash`。
+- `/compact` 手动压缩、自动失败三次熔断、失败保留原历史并继续主请求。
+
 ## 当前核心调用链
 
 ```text
@@ -90,6 +99,8 @@ PermissionEngine 检查黑名单、沙箱、规则、模式和用户审批
 ToolScheduler → ToolRegistry → 内置 Tool 或 McpTool
   ↓
 ToolResult 写回 Conversation
+  ↓
+ContextManager 统一落盘预防、Token估算和可选结构化摘要
   ↓
 Agent 进入下一轮，直到最终文本或停止条件
   ↓
@@ -115,8 +126,28 @@ TUI 通过 AgentEvent 实时展示文本、工具行、结果和状态
 | `src/dragon_code/mcp/config.py` | MCP 两层配置、校验和变量展开 |
 | `src/dragon_code/mcp/manager.py` | MCP 连接、发现、隔离、缓存和关闭 |
 | `src/dragon_code/mcp/tool.py` | 远端 MCP Tool 到 Dragon Code Tool 的适配 |
+| `src/dragon_code/context/state.py` | 会话路径、冻结账本、usage锚点和熔断状态 |
+| `src/dragon_code/context/summary.py` | 摘要Prompt、解析、近期原文边界和新历史纯函数 |
+| `src/dragon_code/context/manager.py` | 工具结果落盘、Token估算、自动/手动压缩协调 |
 
 ## 最近验证状态
+
+ch08 完成时的证据：
+
+- `uv sync --locked`：57个包锁定检查通过。
+- `uv run ruff format --check .`：121个文件已格式化。
+- `uv run ruff check .`：通过。
+- `uv run python -m compileall -q src tests`：通过。
+- `uv run pytest -q`：`304 passed, 2 skipped`。
+- Windows真实DeepSeek：主模型 `deepseek-v4-pro`，摘要模型 `deepseek-v4-flash`。
+- 121911字节结果完整保存在L盘，真实主模型通过Read分页确认尾部标记。
+- 自动摘要后当前消息保留且主任务继续；低Token `/compact` 成功。
+- 自动连续失败三次熔断和手动绕过由可控自动化测试验证。
+- 本机没有WSL/tmux，真实证据使用Windows等价链路并在报告中明确说明。
+
+完整证据见 `specs/ch08-context-management/acceptance-report.md`。
+
+ch07 完成时的历史证据：
 
 ch07 完成时的证据：
 
@@ -211,10 +242,10 @@ uv run python -m dragon_code
 
 推荐顺序：
 
-1. 回顾 ch07 核心源码：`mcp/config.py → manager.py → tool.py → cli.py → permission/TUI`。
-2. 将 ch06/ch07 值得记忆的内容补入 `docs/learning-notes.md`。
-3. 学习教材 ch08 Python 理论部分。
-4. 按 `AGENTS.md` 的四文档流程启动 ch08 上下文管理开发。
+1. 回顾 ch08 核心源码：`context/state.py → summary.py → manager.py → agent.py → tui.py`。
+2. 将ch08上下文管理的核心调用链和面试表达补入 `docs/learning-notes.md`。
+3. 学习下一章理论内容。
+4. 按 `AGENTS.md` 的四文档流程启动下一章开发。
 
 ## 每章验收后的更新模板
 

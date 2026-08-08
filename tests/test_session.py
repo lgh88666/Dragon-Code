@@ -1,6 +1,6 @@
 """Conversation 对话历史测试。"""
 
-from dragon_code.models import ChatMessage
+from dragon_code.models import ChatMessage, ToolCall, ToolResult
 from dragon_code.session import Conversation
 
 
@@ -38,3 +38,37 @@ def test_commit_messages_keeps_batch_order():
     conversation.commit_messages(batch)
 
     assert conversation.get_messages() == batch
+
+
+def test_replace_messages_deep_copies_nested_tool_data():
+    conversation = Conversation()
+    replacement = [
+        ChatMessage(
+            "assistant",
+            tool_calls=[ToolCall("c1", "Read", {"path": "a.py"})],
+        ),
+        ChatMessage(
+            "tool",
+            tool_results=[ToolResult("c1", "Read", True, "原结果")],
+        ),
+    ]
+
+    conversation.replace_messages(replacement)
+    replacement[0].tool_calls[0].arguments["path"] = "changed.py"
+    replacement[1].tool_results[0].content = "被修改"
+    copied = conversation.get_messages()
+
+    assert copied[0].tool_calls[0].arguments["path"] == "a.py"
+    assert copied[1].tool_results[0].content == "原结果"
+
+    copied[0].tool_calls.clear()
+    assert len(conversation.get_messages()[0].tool_calls) == 1
+
+
+def test_replace_messages_can_clear_history():
+    conversation = Conversation()
+    conversation.commit_messages([ChatMessage("user", "旧历史")])
+
+    conversation.replace_messages([])
+
+    assert conversation.get_messages() == []

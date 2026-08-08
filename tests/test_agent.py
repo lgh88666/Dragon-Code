@@ -7,6 +7,7 @@ from pydantic import BaseModel
 
 from dragon_code.agent import Agent
 from dragon_code.clients.base import LLMClient, LLMError
+from dragon_code.context.manager import ContextManager
 from dragon_code.models import (
     AgentEvent,
     ChatMessage,
@@ -32,12 +33,22 @@ class DemoTool(Tool):
     category = "test"
     arguments_model = EmptyArguments
 
-    def __init__(self, name="Demo", *, safe=True, started=None, delay=0, fail=False):
+    def __init__(
+        self,
+        name="Demo",
+        *,
+        safe=True,
+        started=None,
+        delay=0,
+        fail=False,
+        result_content=None,
+    ):
         self.name = name
         self.is_concurrency_safe = safe
         self.started = started
         self.delay = delay
         self.fail = fail
+        self.result_content = result_content
         self.calls = []
 
     async def run(self, call, arguments):
@@ -48,7 +59,7 @@ class DemoTool(Tool):
             await asyncio.sleep(self.delay)
         if self.fail:
             raise RuntimeError("测试工具主动失败")
-        return self._success(call, f"result-{call.id}")
+        return self._success(call, self.result_content or f"result-{call.id}")
 
 
 class SequenceClient(LLMClient):
@@ -137,6 +148,19 @@ async def collect_with_approval(agent, choice, text="执行"):
     return events
 
 
+VALID_SUMMARY = """<analysis>草稿</analysis><summary>
+1. 主要请求和意图：继续任务
+2. 关键技术概念：上下文
+3. 文件和代码段：无
+4. 错误与修复：无
+5. 问题解决过程：无
+6. 用户消息原文：原话
+7. 待办任务：继续
+8. 当前工作和停止位置：测试
+9. 可能的下一步：实现
+</summary>"""
+
+
 def permission_engine(working_dir, *, load_settings=False):
     root = Path(working_dir)
     rules = (
@@ -163,6 +187,271 @@ def test_permission_mode_cycles_in_fixed_order():
     assert agent.cycle_permission_mode() is PermissionMode.PLAN
     assert agent.cycle_permission_mode() is PermissionMode.BYPASS_PERMISSIONS
     assert agent.cycle_permission_mode() is PermissionMode.DEFAULT
+
+
+async def test_agent_offloads_full_tool_result_before_tui_and_history(tmp_path):
+    content = "龙" * 20_000
+    tool = DemoTool(result_content=content)
+    call = ToolCall("large/read", tool.name, {})
+    client = SequenceClient([response(calls=[call]), response("处理完成")])
+    conversation = Conversation()
+    context_manager = ContextManager(
+        tmp_path,
+        session_id="1234567890-deadbeef",
+    )
+    agent = make_agent(
+        client,
+        conversation=conversation,
+        registry=registry_with(tool),
+        working_dir=tmp_path,
+        permission_engine=permission_engine(tmp_path),
+        permission_mode=PermissionMode.BYPASS_PERMISSIONS,
+        context_manager=context_manager,
+    )
+
+    events = await collect(agent)
+
+    visible_result = next(event.tool_result for event in events if event.type == "tool_end")
+    history_result = conversation.get_messages()[2].tool_results[0]
+    assert visible_result.content == history_result.content
+    assert visible_result.metadata["context_offloaded"] is True
+    saved = Path(visible_result.metadata["result_path"])
+    assert saved.read_bytes() == content.encode("utf-8")
+
+
+async def test_agent_warns_safely_when_large_result_cannot_be_saved(tmp_path, monkeypatch):
+    content = "x" * 50_001
+    tool = DemoTool(result_content=content)
+    call = ToolCall("large", tool.name, {})
+    client = SequenceClient([response(calls=[call]), response("继续完成")])
+    manager = ContextManager(tmp_path, session_id="1234567890-deadbeef")
+
+    def fail_write(path, value):
+        raise OSError("secret-path-and-key-must-not-leak")
+
+    monkeypatch.setattr(manager, "_write_result_sync", fail_write)
+    agent = make_agent(
+        client,
+        registry=registry_with(tool),
+        working_dir=tmp_path,
+        permission_engine=permission_engine(tmp_path),
+        permission_mode=PermissionMode.BYPASS_PERMISSIONS,
+        context_manager=manager,
+    )
+
+    events = await collect(agent)
+
+    warning = next(event for event in events if event.type == "context_warning")
+    result = next(event.tool_result for event in events if event.type == "tool_end")
+    assert "落盘失败" in warning.text
+    assert "secret-path" not in warning.text
+    assert result.content == content
+
+
+async def test_agent_auto_compacts_before_main_request_and_keeps_current_user(tmp_path):
+    main_client = SequenceClient([response("主请求完成")])
+    summary_client = SequenceClient([response(VALID_SUMMARY)])
+    conversation = Conversation()
+    conversation.commit_messages(
+        [ChatMessage("user", "旧问题"), ChatMessage("assistant", "旧回答")]
+    )
+    tool = DemoTool()
+    tool.description = "x" * 70_000
+    context_manager = ContextManager(
+        tmp_path,
+        session_id="1234567890-deadbeef",
+        summary_client=summary_client,
+        context_window=50_000,
+    )
+    agent = make_agent(
+        main_client,
+        conversation=conversation,
+        registry=registry_with(tool),
+        working_dir=tmp_path,
+        context_manager=context_manager,
+    )
+
+    events = await collect(agent, "本轮用户原文")
+
+    phases = [event.compact.phase for event in events if event.compact is not None]
+    assert phases[:2] == ["auto_start", "auto_complete"]
+    assert main_client.requests[0].messages[-1].content == "本轮用户原文"
+    assert summary_client.requests[0].tools == []
+    assert conversation.get_messages()[-2].content == "本轮用户原文"
+
+
+async def test_manual_compact_does_not_call_main_client_or_change_breaker(tmp_path):
+    main_client = SequenceClient([])
+    summary_client = SequenceClient([response(VALID_SUMMARY)])
+    conversation = Conversation()
+    conversation.commit_messages([ChatMessage("user", "已有历史")])
+    context_manager = ContextManager(
+        tmp_path,
+        session_id="1234567890-deadbeef",
+        summary_client=summary_client,
+    )
+    context_manager.circuit_breaker.record_failure()
+    agent = make_agent(
+        main_client,
+        conversation=conversation,
+        working_dir=tmp_path,
+        context_manager=context_manager,
+    )
+
+    events = [event async for event in agent.compact_context()]
+
+    assert events[0].compact.phase == "manual_complete"
+    assert main_client.requests == []
+    assert summary_client.requests[0].tools == []
+    assert context_manager.circuit_breaker.consecutive_failures == 1
+    assert conversation.get_messages()[0].content.startswith("<summary>")
+
+
+async def test_auto_summary_happens_before_main_client_call(tmp_path):
+    order = []
+
+    class TrackingClient(SequenceClient):
+        def __init__(self, label, responses):
+            super().__init__(responses)
+            self.label = label
+
+        async def stream(self, request):
+            order.append(self.label)
+            async for event in super().stream(request):
+                yield event
+
+    main_client = TrackingClient("main", [response("完成")])
+    summary_client = TrackingClient("summary", [response(VALID_SUMMARY)])
+    conversation = Conversation()
+    conversation.commit_messages([ChatMessage("user", "旧历史")])
+    tool = DemoTool()
+    tool.description = "x" * 70_000
+    agent = make_agent(
+        main_client,
+        conversation=conversation,
+        registry=registry_with(tool),
+        working_dir=tmp_path,
+        context_manager=ContextManager(
+            tmp_path,
+            session_id="1234567890-deadbeef",
+            summary_client=summary_client,
+            context_window=50_000,
+        ),
+    )
+
+    await collect(agent, "本轮")
+
+    assert order == ["summary", "main"]
+
+
+async def test_current_user_is_not_committed_when_main_fails_after_auto_compact(tmp_path):
+    main_client = SequenceClient([LLMError("network", "主模型失败")])
+    summary_client = SequenceClient([response(VALID_SUMMARY)])
+    conversation = Conversation()
+    conversation.commit_messages([ChatMessage("user", "旧历史")])
+    tool = DemoTool()
+    tool.description = "x" * 70_000
+    agent = make_agent(
+        main_client,
+        conversation=conversation,
+        registry=registry_with(tool),
+        working_dir=tmp_path,
+        context_manager=ContextManager(
+            tmp_path,
+            session_id="1234567890-deadbeef",
+            summary_client=summary_client,
+            context_window=50_000,
+        ),
+    )
+
+    events = await collect(agent, "不得提交的本轮用户消息")
+
+    assert events[-1].type == "error"
+    assert all(
+        message.content != "不得提交的本轮用户消息" for message in conversation.get_messages()
+    )
+
+
+async def test_auto_summary_failure_keeps_history_and_continues_main(tmp_path):
+    main_client = SequenceClient([response("主模型仍然完成")])
+    summary_client = SequenceClient([response("无有效摘要")])
+    conversation = Conversation()
+    conversation.commit_messages([ChatMessage("user", "旧历史")])
+    tool = DemoTool()
+    tool.description = "x" * 70_000
+    manager = ContextManager(
+        tmp_path,
+        session_id="1234567890-deadbeef",
+        summary_client=summary_client,
+        context_window=50_000,
+    )
+    agent = make_agent(
+        main_client,
+        conversation=conversation,
+        registry=registry_with(tool),
+        working_dir=tmp_path,
+        context_manager=manager,
+    )
+
+    events = await collect(agent, "本轮")
+
+    phases = [event.compact.phase for event in events if event.compact is not None]
+    assert "auto_failed" in phases
+    assert events[-1].type == "completed"
+    assert conversation.get_messages()[0].content == "旧历史"
+    assert manager.circuit_breaker.consecutive_failures == 1
+
+
+async def test_third_auto_summary_failure_emits_circuit_event(tmp_path):
+    main_client = SequenceClient(
+        [
+            response("完成1", usage=(20_000, 100)),
+            response("完成2", usage=(20_000, 100)),
+            response("完成3", usage=(20_000, 100)),
+        ]
+    )
+    summary_client = SequenceClient([response("无摘要1"), response("无摘要2"), response("无摘要3")])
+    tool = DemoTool()
+    tool.description = "x" * 70_000
+    manager = ContextManager(
+        tmp_path,
+        session_id="1234567890-deadbeef",
+        summary_client=summary_client,
+        context_window=50_000,
+    )
+    agent = make_agent(
+        main_client,
+        registry=registry_with(tool),
+        working_dir=tmp_path,
+        context_manager=manager,
+    )
+
+    await collect(agent, "第一轮")
+    await collect(agent, "第二轮")
+    third = await collect(agent, "第三轮")
+
+    phases = [event.compact.phase for event in third if event.compact is not None]
+    assert phases == ["auto_start", "auto_failed", "circuit_tripped"]
+    assert manager.circuit_breaker.tripped is True
+
+
+async def test_active_tool_definitions_are_built_once_per_iteration(tmp_path):
+    class CountingRegistry(ToolRegistry):
+        def __init__(self):
+            super().__init__()
+            self.definition_calls = 0
+
+        def definitions(self):
+            self.definition_calls += 1
+            return super().definitions()
+
+    registry = CountingRegistry()
+    client = SequenceClient([response("完成")])
+    agent = make_agent(client, registry=registry, working_dir=tmp_path)
+
+    await collect(agent)
+
+    assert registry.definition_calls == 1
 
 
 async def test_blacklist_denial_returns_result_without_execution(tmp_path):

@@ -14,6 +14,7 @@ from dragon_code.clients.base import LLMError
 from dragon_code.models import (
     AppConfig,
     ChatMessage,
+    CompactEvent,
     LLMEvent,
     ProviderConfig,
     TokenUsage,
@@ -35,6 +36,19 @@ from dragon_code.tui import (
 
 def provider_config(name: str = "Fake", model: str = "fake-model") -> ProviderConfig:
     return ProviderConfig(name, "openai", "fake-key", model)
+
+
+VALID_SUMMARY = """<analysis>草稿</analysis><summary>
+1. 主要请求和意图：继续任务
+2. 关键技术概念：上下文
+3. 文件和代码段：无
+4. 错误与修复：无
+5. 问题解决过程：无
+6. 用户消息原文：原话
+7. 待办任务：继续
+8. 当前工作和停止位置：测试
+9. 可能的下一步：实现
+</summary>"""
 
 
 def app_with_client(fake_client: FakeClient) -> DragonCodeApp:
@@ -117,6 +131,148 @@ async def test_multiple_provider_selection():
         assert str(app.query_one("#provider-name", Static).render()) == "default"
         assert app.client is not None
         assert app.client.chunks == ["Two"]
+
+
+async def test_provider_activation_creates_distinct_main_and_summary_clients():
+    created_configs = []
+    created_clients = []
+
+    def factory(config):
+        created_configs.append(config)
+        client = FakeClient()
+        client.config = config
+        created_clients.append(client)
+        return client
+
+    config = provider_config(model="deepseek-v4-pro")
+    config.summary_model = "deepseek-v4-flash"
+    app = DragonCodeApp(AppConfig([config]), client_factory=factory)
+
+    async with app.run_test(size=(90, 30)) as pilot:
+        await pilot.pause()
+
+        assert [item.model for item in created_configs] == [
+            "deepseek-v4-pro",
+            "deepseek-v4-flash",
+        ]
+        assert app.client is created_clients[0]
+        assert app.summary_client is created_clients[1]
+        assert app.client is not app.summary_client
+
+
+async def test_manual_compact_uses_summary_client_without_main_request():
+    main_client = FakeClient()
+    summary_client = FakeClient(events=complete_response(VALID_SUMMARY))
+
+    def factory(config):
+        client = summary_client if config.model == "deepseek-v4-flash" else main_client
+        client.config = config
+        return client
+
+    config = provider_config(model="deepseek-v4-pro")
+    config.summary_model = "deepseek-v4-flash"
+    app = DragonCodeApp(AppConfig([config]), client_factory=factory)
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        app.agent.conversation.commit_messages([ChatMessage("user", "已有历史")])
+        app.query_one("#message-input", MessageInput).load_text("/compact")
+        await pilot.press("enter")
+        await wait_until_idle(app, pilot)
+
+        assert main_client.requests == []
+        assert len(summary_client.requests) == 1
+        assert summary_client.requests[0].tools == []
+        history = app.agent.conversation.get_messages()
+        assert all(message.content != "/compact" for message in history)
+        assert history[0].content.startswith("<summary>")
+
+        conversation = app.query_one("#conversation", RichLog)
+        conversation.text_select_all()
+        selected = app.screen.get_selected_text() or ""
+        assert "上下文压缩完成" in selected
+
+
+async def test_manual_compact_failure_hides_raw_exception_text():
+    main_client = FakeClient()
+
+    class UnsafeSummaryClient(FakeClient):
+        async def stream(self, request):
+            raise RuntimeError("sk-secret-value must not leak")
+            yield  # pragma: no cover
+
+    summary_client = UnsafeSummaryClient()
+
+    def factory(config):
+        return summary_client if config.model == "deepseek-v4-flash" else main_client
+
+    config = provider_config(model="deepseek-v4-pro")
+    config.summary_model = "deepseek-v4-flash"
+    app = DragonCodeApp(AppConfig([config]), client_factory=factory)
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        app.agent.conversation.commit_messages([ChatMessage("user", "历史")])
+        app.query_one("#message-input", MessageInput).load_text("/compact")
+        await pilot.press("enter")
+        await wait_until_idle(app, pilot)
+
+        conversation = app.query_one("#conversation", RichLog)
+        conversation.text_select_all()
+        selected = app.screen.get_selected_text() or ""
+        assert "上下文压缩失败" in selected
+        assert "sk-secret-value" not in selected
+
+
+async def test_escape_cancels_manual_compact_and_restores_input():
+    main_client = FakeClient()
+    summary_client = FakeClient(chunks=[VALID_SUMMARY], delay=10)
+
+    def factory(config):
+        return summary_client if config.model == "deepseek-v4-flash" else main_client
+
+    config = provider_config(model="deepseek-v4-pro")
+    config.summary_model = "deepseek-v4-flash"
+    app = DragonCodeApp(AppConfig([config]), client_factory=factory)
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        app.agent.conversation.commit_messages([ChatMessage("user", "历史")])
+        input_widget = app.query_one("#message-input", MessageInput)
+        input_widget.load_text("/compact")
+        await pilot.press("enter")
+        await wait_until_state(app, pilot, SessionState.STREAMING)
+        assert input_widget.disabled is True
+
+        await pilot.press("escape")
+        await wait_until_idle(app, pilot)
+
+        assert input_widget.disabled is False
+        assert app.agent.context_manager.circuit_breaker.consecutive_failures == 0
+
+
+async def test_help_and_compact_event_messages_are_visible():
+    app = app_with_client(FakeClient())
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        input_widget = app.query_one("#message-input", MessageInput)
+        input_widget.load_text("/help")
+        await pilot.press("enter")
+        app._write_compact_event(CompactEvent("auto_start", before_tokens=20_000))
+        app._write_compact_event(
+            CompactEvent("auto_complete", before_tokens=20_000, after_tokens=8_000)
+        )
+        app._write_compact_event(CompactEvent("auto_failed", message="安全失败"))
+        app._write_compact_event(CompactEvent("circuit_tripped", message="已熔断"))
+        await pilot.pause()
+
+        conversation = app.query_one("#conversation", RichLog)
+        conversation.text_select_all()
+        selected = app.screen.get_selected_text() or ""
+        assert "/compact" in selected
+        assert "20000 → 8000 Token" in selected
+        assert "安全失败" in selected
+        assert "已熔断" in selected
 
 
 async def test_alt_enter_inserts_newline_and_enter_submits():
@@ -673,4 +829,13 @@ def test_tool_line_and_result_summary_are_short():
     assert format_tool_call(call) == "● Read(src/app.py)"
     assert len(format_tool_result(success)) < 270
     assert "已截断" in format_tool_result(success)
+    offloaded = ToolResult(
+        "3",
+        "Read",
+        True,
+        content="预览",
+        metadata={"context_offloaded": True},
+        truncated=True,
+    )
+    assert "完整结果已保存" in format_tool_result(offloaded)
     assert format_tool_result(failure) == "文件不存在"

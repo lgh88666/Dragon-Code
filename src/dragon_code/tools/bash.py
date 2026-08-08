@@ -8,8 +8,6 @@ from pydantic import BaseModel, Field
 from dragon_code.models import ToolCall, ToolResult
 from dragon_code.tools.base import Tool
 
-MAX_COMMAND_OUTPUT = 100_000
-
 
 class BashArguments(BaseModel):
     command: str = Field(
@@ -50,21 +48,14 @@ class BashTool(Tool):
 
         stdout = stdout_bytes.decode("utf-8", errors="replace")
         stderr = stderr_bytes.decode("utf-8", errors="replace")
-        truncated = len(stdout) + len(stderr) > MAX_COMMAND_OUTPUT
-        remaining = MAX_COMMAND_OUTPUT
-        shown_stdout = stdout[:remaining]
-        remaining -= len(shown_stdout)
-        shown_stderr = stderr[:remaining]
         metadata = {
-            "stdout": shown_stdout,
-            "stderr": shown_stderr,
+            "stdout": stdout,
+            "stderr": stderr,
             "exit_code": process.returncode,
         }
-        content = (
-            f"stdout:\n{shown_stdout}\nstderr:\n{shown_stderr}\nexit_code: {process.returncode}"
-        )
+        content = f"stdout:\n{stdout}\nstderr:\n{stderr}\nexit_code: {process.returncode}"
         if process.returncode == 0:
-            return self._success(call, content, metadata=metadata, truncated=truncated)
+            return self._success(call, content, metadata=metadata)
         return ToolResult(
             call_id=call.id,
             tool_name=self.name,
@@ -73,5 +64,4 @@ class BashTool(Tool):
             error_code="nonzero_exit",
             error_message=f"命令退出码为 {process.returncode}。",
             metadata=metadata,
-            truncated=truncated,
         )

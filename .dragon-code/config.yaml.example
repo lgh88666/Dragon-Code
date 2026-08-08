@@ -4,6 +4,10 @@ providers:
     api_key: "请填写你的 Anthropic API Key"
     model: "claude-sonnet-4-5"
     thinking: true
+    # 可省略；Anthropic 默认使用 200000 Token 窗口。
+    context_window: 200000
+    # 可省略；省略时摘要复用主模型。
+    summary_model: "你的轻量摘要模型名称"
 
   - name: "OpenAI Compatible"
     protocol: "openai"
@@ -13,6 +17,10 @@ providers:
     base_url: "https://api.openai.com/v1"
     # OpenAI Chat Completions 首版不会使用 thinking 配置。
     thinking: false
+    # 可省略；OpenAI 及兼容端点默认使用 128000 Token 窗口。
+    context_window: 128000
+    # DeepSeek 兼容端点可填写 deepseek-v4-flash。
+    summary_model: "你的轻量摘要模型名称"
 
 # MCP Server 可以只配置 stdio，也可以同时配置多个 Server。
 mcp_servers:

@@ -10,7 +10,6 @@ from dragon_code.models import ToolCall, ToolResult
 from dragon_code.tools.base import Tool, ToolExecutionError
 from dragon_code.tools.path_utils import resolve_workspace_path, validate_glob_pattern
 
-MAX_RESULTS = 200
 MAX_MATCH_LINE = 500
 SKIP_DIRS = {".git", ".venv", "node_modules", "__pycache__", ".pytest_cache", ".ruff_cache"}
 
@@ -53,13 +52,10 @@ class GlobTool(SearchTool):
             if resolved.is_file():
                 matches.append(relative.as_posix())
         matches.sort()
-        truncated = len(matches) > MAX_RESULTS
-        selected = matches[:MAX_RESULTS]
         return self._success(
             call,
-            "\n".join(selected),
+            "\n".join(matches),
             metadata={"matches": len(matches)},
-            truncated=truncated,
         )
 
 
@@ -99,12 +95,10 @@ class GrepTool(SearchTool):
             for line_number, line in enumerate(lines, 1):
                 if regex.search(line):
                     total += 1
-                    if len(matches) < MAX_RESULTS:
-                        relative = path.relative_to(self.workdir).as_posix()
-                        matches.append(f"{relative}:{line_number}: {line[:MAX_MATCH_LINE]}")
+                    relative = path.relative_to(self.workdir).as_posix()
+                    matches.append(f"{relative}:{line_number}: {line[:MAX_MATCH_LINE]}")
         return self._success(
             call,
             "\n".join(matches),
             metadata={"matches": total},
-            truncated=total > MAX_RESULTS,
         )

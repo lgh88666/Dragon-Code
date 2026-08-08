@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.pytest_tmp*/
 .ruff_cache/
 .coverage
 htmlcov/
@@ -9,5 +10,6 @@ htmlcov/
 # 真实 Provider 配置包含 API Key，禁止提交。
 .dragon-code/config.yaml
 .dragon-code/settings.local.yaml
+.dragon-code/sessions/
 .env
 .env.*

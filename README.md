@@ -2,7 +2,7 @@
 
 Dragon Code 是一个使用 Python 构建的、Claude Code 风格终端 AI 编程助手。
 
-当前已完成 ch02–ch07 的核心能力：
+当前已完成 ch02–ch08 的核心能力：
 
 - Anthropic 与 OpenAI Chat Completions 两种协议
 - OpenAI 兼容端点
@@ -18,6 +18,9 @@ Dragon Code 是一个使用 Python 构建的、Claude Code 风格终端 AI 编�
 - 黑名单、路径沙箱、三级规则、权限模式和 HITL 五层权限系统
 - stdio 与 Streamable HTTP 两种 MCP 传输
 - 启动期 MCP 工具自动发现、命名隔离和连接复用
+- 工具大结果自动落盘、稳定预览和按路径重读
+- 对话窗口逼近上限时自动生成结构化摘要
+- `/compact` 手动压缩与连续三次自动失败熔断
 
 当前仍不包含 MCP Resources/Prompts、自动重连、网络访问限制、资源配额和审计日志。
 
@@ -69,7 +72,13 @@ providers:
     api_key: "你的 API Key"
     model: "你的模型名称"
     base_url: "https://你的服务地址/v1"
+    context_window: 128000
+    summary_model: "你的轻量摘要模型名称"
 ```
+
+`context_window` 可省略；Anthropic 默认 200000，OpenAI 及兼容端点默认
+128000。`summary_model` 可省略，省略时复用主模型。DeepSeek 兼容端点可将其配置为
+`deepseek-v4-flash`；摘要 Client 复用相同协议、API Key 和 `base_url`，但不会携带工具。
 
 `.dragon-code/config.yaml` 已被 Git 忽略。不要把真实 API Key 写入示例文件、README 或提交记录。
 
@@ -126,11 +135,21 @@ uv run python -m dragon_code
 - `/exit`：退出
 - `/plan`：进入只读计划模式
 - `/do`：执行已经完成的计划
+- `/compact`：立即压缩当前对话上下文
 - Shift+Tab：循环切换四种权限模式
 - Esc：取消当前 Agent 任务
 - Ctrl+C：有选中文字时复制；任务中取消；空闲时退出
 
 等待模型时会显示 `Imagining… (Ns)`；回复流式结束后会重新渲染为 Markdown。
+
+单个工具结果超过 50000 UTF-8 字节，或同轮未替换结果合计超过 200000 字节时，
+完整内容会保存在 `.dragon-code/sessions/<session_id>/tool-results/`，对话只保留预览和
+Read 重读路径。该目录退出后保留，并已被 Git 忽略。
+Read 支持可选的 `offset`（起始行）和 `limit`（最多行数），可按预览提示分段读取
+大型结果，避免整体重读后再次超过阈值。
+
+普通请求逼近模型窗口时会自动压缩较早历史并保留近期原文。自动摘要连续失败三次后
+进入熔断，但仍会继续主请求；用户可以随时在空闲状态使用 `/compact` 手动重试。
 
 ## 权限系统
 
@@ -176,4 +195,4 @@ uv run pytest -q
 ```
 
 最终验收需在 tmux 中启动 Dragon Code，输入真实对话，并逐项核对
-[`specs/ch07-mcp-client/checklist.md`](specs/ch07-mcp-client/checklist.md)。
+[`specs/ch08-context-management/checklist.md`](specs/ch08-context-management/checklist.md)。

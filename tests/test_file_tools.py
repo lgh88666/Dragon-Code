@@ -85,13 +85,30 @@ async def test_file_tools_reject_outside_path(tmp_path):
     outside.unlink()
 
 
-async def test_read_truncates_large_file(tmp_path):
+async def test_read_returns_complete_large_file(tmp_path):
     path = tmp_path / "large.txt"
     path.write_text("\n".join(f"line-{index}" for index in range(2100)), encoding="utf-8")
     result = await ReadTool(tmp_path).execute(ToolCall("1", "Read", {"path": str(path)}))
     assert result.success
-    assert result.truncated
+    assert result.truncated is False
     assert result.metadata["line_count"] == 2100
+    assert "line-2099" in result.content
+
+
+async def test_read_can_page_through_saved_large_results(tmp_path):
+    path = tmp_path / "large.txt"
+    path.write_text("\n".join(f"line-{index}" for index in range(500)), encoding="utf-8")
+
+    result = await ReadTool(tmp_path).execute(
+        ToolCall("1", "Read", {"path": str(path), "offset": 451, "limit": 50})
+    )
+
+    assert result.success
+    assert result.content.splitlines()[0].startswith(" 451 | line-450")
+    assert result.content.splitlines()[-1].startswith(" 500 | line-499")
+    assert result.metadata["line_count"] == 500
+    assert result.metadata["returned_lines"] == 50
+    assert result.metadata["has_more"] is False
 
 
 async def test_symlink_cannot_escape_workspace(tmp_path):

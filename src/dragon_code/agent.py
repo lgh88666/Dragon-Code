@@ -4,9 +4,11 @@ import asyncio
 from pathlib import Path
 
 from dragon_code.clients.base import LLMClient, LLMError
+from dragon_code.context.manager import ContextManager
 from dragon_code.models import (
     AgentEvent,
     ChatMessage,
+    CompactEvent,
     LLMRequest,
     TokenUsage,
     ToolCall,
@@ -47,6 +49,7 @@ class Agent:
         permission_engine: PermissionEngine | None = None,
         approval_controller: ApprovalController | None = None,
         permission_mode: PermissionMode = PermissionMode.DEFAULT,
+        context_manager: ContextManager | None = None,
     ):
         self.client = client
         self.conversation = conversation
@@ -56,6 +59,7 @@ class Agent:
         self.plan_registry = registry.subset({"Read", "Glob", "Grep"})
         self.max_iterations = max_iterations
         self.unknown_tool_limit = unknown_tool_limit
+        self.context_manager = context_manager or ContextManager(self.working_dir)
 
         # 默认空规则只用于向后兼容和测试；TUI 启动时会注入真实三级配置。
         if permission_engine is None:
@@ -110,7 +114,26 @@ class Agent:
             self.active_client_task.cancel()
         if self.scheduler is not None:
             self.scheduler.cancel_active()
+        self.context_manager.cancel_active()
         self.approval_controller.cancel()
+
+    async def compact_context(self):
+        """手动压缩已提交历史，不发起普通对话请求。"""
+
+        outcome = await self.context_manager.force_compact(self.conversation.get_messages())
+        phase = "manual_complete" if outcome.success else "manual_failed"
+        if outcome.success:
+            self.conversation.replace_messages(outcome.history)
+        yield AgentEvent(
+            type="compact",
+            compact=CompactEvent(
+                phase=phase,
+                before_tokens=outcome.stats.before_tokens,
+                after_tokens=outcome.stats.after_tokens,
+                offloaded_results=outcome.stats.offloaded_results,
+                message=outcome.stats.error,
+            ),
+        )
 
     async def run(self, user_text: str):
         """运行一个完整任务，异步产出界面所需事件。"""
@@ -125,8 +148,7 @@ class Agent:
             self.client.model,
         )
 
-        request_messages = self.conversation.build_request_messages(user_text)
-        user_message = request_messages[-1]
+        user_message = ChatMessage(role="user", content=user_text)
         user_committed = False
         unknown_rounds = 0
 
@@ -137,11 +159,64 @@ class Agent:
                 max_iterations=self.max_iterations,
             )
 
-            collector = StreamCollector()
             reminder = plan_reminder(iteration) if self.mode is PermissionMode.PLAN else None
+            tool_definitions = active_registry.definitions()
+            committed_history = self.conversation.get_messages()
+            pending_messages = [] if user_committed else [user_message]
+            candidate_request = LLMRequest(
+                messages=[*committed_history, *pending_messages],
+                tools=tool_definitions,
+                system=system_prompt,
+                reminder=reminder,
+            )
+            will_compact, before_tokens, _ = self.context_manager.auto_compact_status(
+                candidate_request
+            )
+            if will_compact:
+                yield AgentEvent(
+                    type="compact",
+                    compact=CompactEvent(
+                        phase="auto_start",
+                        before_tokens=before_tokens,
+                        offloaded_results=self.context_manager.offloaded_results,
+                    ),
+                )
+            prepared = await self.context_manager.prepare_request(
+                committed_history,
+                pending_messages,
+                system_prompt,
+                tool_definitions,
+                reminder,
+            )
+            if prepared.compact is not None:
+                phase = "auto_complete" if prepared.compact.success else "auto_failed"
+                stats = prepared.compact.stats
+                yield AgentEvent(
+                    type="compact",
+                    compact=CompactEvent(
+                        phase=phase,
+                        before_tokens=stats.before_tokens,
+                        after_tokens=stats.after_tokens,
+                        offloaded_results=stats.offloaded_results,
+                        message=stats.error,
+                    ),
+                )
+                if prepared.compact.success:
+                    self.conversation.replace_messages(prepared.committed_history)
+            if prepared.circuit_tripped:
+                yield AgentEvent(
+                    type="compact",
+                    compact=CompactEvent(
+                        phase="circuit_tripped",
+                        before_tokens=before_tokens,
+                        message="自动上下文压缩已连续失败 3 次，请使用 /compact 手动重试。",
+                    ),
+                )
+
+            collector = StreamCollector()
             llm_request = LLMRequest(
-                messages=list(request_messages),
-                tools=active_registry.definitions(),
+                messages=prepared.request_messages,
+                tools=tool_definitions,
                 system=system_prompt,
                 reminder=reminder,
             )
@@ -193,6 +268,11 @@ class Agent:
             self.task_usage = self.task_usage.add(response.usage)
             yield AgentEvent(type="usage", usage=self.task_usage)
             assistant_message = response.message
+            self.context_manager.record_main_usage(
+                llm_request,
+                assistant_message,
+                response.usage,
+            )
 
             if not assistant_message.tool_calls:
                 messages_to_commit = []
@@ -210,11 +290,23 @@ class Agent:
                 )
                 return
 
-            results = []
+            raw_results = []
             async for tool_event in self._execute_tools(assistant_message.tool_calls):
-                yield tool_event
                 if tool_event.tool_result is not None:
-                    results.append(tool_event.tool_result)
+                    raw_results.append(tool_event.tool_result)
+                else:
+                    yield tool_event
+            results = await self.context_manager.process_tool_results(raw_results)
+            if self.context_manager.last_offload_failures:
+                yield AgentEvent(
+                    type="context_warning",
+                    text=(
+                        f"{self.context_manager.last_offload_failures} 个大型工具结果落盘失败，"
+                        "本轮已保留原始内容。"
+                    ),
+                )
+            for result in results:
+                yield AgentEvent(type="tool_end", tool_result=result)
             was_cancelled = self.cancel_requested
 
             messages_to_commit = []
@@ -228,7 +320,6 @@ class Agent:
                 ]
             )
             self.conversation.commit_messages(messages_to_commit)
-            request_messages = self.conversation.get_messages()
 
             if was_cancelled:
                 yield AgentEvent(

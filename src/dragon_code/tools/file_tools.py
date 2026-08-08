@@ -9,12 +9,15 @@ from dragon_code.models import ToolCall, ToolResult
 from dragon_code.tools.base import Tool, ToolExecutionError
 from dragon_code.tools.path_utils import resolve_workspace_path
 
-MAX_READ_LINES = 2000
-MAX_READ_CHARS = 100_000
-
 
 class ReadArguments(BaseModel):
     path: str = Field(description="要读取的文件路径，可使用工作目录内的相对路径。")
+    offset: int = Field(default=1, ge=1, description="从第几行开始读取，默认为第1行。")
+    limit: int | None = Field(
+        default=None,
+        ge=1,
+        description="最多读取多少行；省略时读取到文件末尾。",
+    )
 
 
 class WriteArguments(BaseModel):
@@ -63,16 +66,22 @@ class ReadTool(WorkspaceTool):
         except UnicodeDecodeError as error:
             raise ToolExecutionError("encoding_error", "文件不是可读取的 UTF-8 文本。") from error
 
-        selected = lines[:MAX_READ_LINES]
-        numbered = "\n".join(f"{index:>4} | {line}" for index, line in enumerate(selected, 1))
-        truncated = len(lines) > MAX_READ_LINES or len(numbered) > MAX_READ_CHARS
-        if len(numbered) > MAX_READ_CHARS:
-            numbered = numbered[:MAX_READ_CHARS]
+        start = min(arguments.offset - 1, len(lines))
+        end = len(lines) if arguments.limit is None else start + arguments.limit
+        selected = lines[start:end]
+        numbered = "\n".join(
+            f"{index:>4} | {line}" for index, line in enumerate(selected, arguments.offset)
+        )
         return self._success(
             call,
             numbered,
-            metadata={"path": str(path.relative_to(self.workdir)), "line_count": len(lines)},
-            truncated=truncated,
+            metadata={
+                "path": str(path.relative_to(self.workdir)),
+                "line_count": len(lines),
+                "offset": arguments.offset,
+                "returned_lines": len(selected),
+                "has_more": end < len(lines),
+            },
         )
 
 

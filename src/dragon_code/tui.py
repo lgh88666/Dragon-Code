@@ -1,8 +1,10 @@
 """Dragon Code 的 Textual 终端界面。"""
 
+import asyncio
 import os
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from enum import Enum
 from pathlib import Path
 
@@ -24,6 +26,7 @@ from dragon_code import __version__
 from dragon_code.agent import Agent
 from dragon_code.clients.base import LLMClient, LLMError
 from dragon_code.clients.factory import create_llm_client
+from dragon_code.context.manager import ContextManager
 from dragon_code.models import (
     AppConfig,
     ProviderConfig,
@@ -72,7 +75,8 @@ def format_tool_result(result: ToolResult) -> str:
     if len(text) > 240:
         text = text[:237] + "..."
     if result.truncated:
-        text += "（结果已截断）"
+        suffix = "完整结果已保存" if result.metadata.get("context_offloaded") else "结果已截断"
+        text += f"（{suffix}）"
     return text
 
 
@@ -276,6 +280,7 @@ class DragonCodeApp(App):
         self.client_factory = client_factory
         self.session_state = SessionState.SELECTING
         self.client: LLMClient | None = None
+        self.summary_client: LLMClient | None = None
         self.agent: Agent | None = None
         self.reply_buffer = ""
         self.turn_start = 0.0
@@ -330,8 +335,15 @@ class DragonCodeApp(App):
     def _activate_provider(self, index: int) -> None:
         config = self.config.providers[index]
         self.client = self.client_factory(config)
+        summary_config = replace(config, model=config.summary_model or config.model)
+        self.summary_client = self.client_factory(summary_config)
         workdir = Path.cwd()
         rule_store = RuleStore.load(workdir)
+        context_manager = ContextManager(
+            workdir,
+            summary_client=self.summary_client,
+            context_window=config.context_window,
+        )
         self.agent = Agent(
             self.client,
             Conversation(),
@@ -341,6 +353,7 @@ class DragonCodeApp(App):
             permission_engine=PermissionEngine(workdir, rule_store),
             approval_controller=ApprovalController(),
             permission_mode=rule_store.default_mode(),
+            context_manager=context_manager,
         )
         self.session_state = SessionState.IDLE
         self._update_permission_mode_display()
@@ -375,6 +388,9 @@ class DragonCodeApp(App):
             return
         if command == "/do":
             self._execute_plan()
+            return
+        if command == "/compact":
+            self._start_manual_compact()
             return
 
         self._start_turn(text)
@@ -431,10 +447,12 @@ class DragonCodeApp(App):
                 self._write_tool_result(event.tool_result)
             elif event.type == "permission_request" and event.permission_request is not None:
                 self._show_permission_request(event.permission_request)
-            elif event.type == "permission_warning":
+            elif event.type in {"permission_warning", "context_warning"}:
                 self.query_one("#conversation", RichLog).write(
                     Text(f"● {event.text}", style="bold yellow")
                 )
+            elif event.type == "compact" and event.compact is not None:
+                self._write_compact_event(event.compact)
             elif event.type == "usage" and event.usage is not None:
                 self.task_usage = event.usage
                 self._update_usage_status(event.usage, task_in_progress=True)
@@ -453,6 +471,59 @@ class DragonCodeApp(App):
                         LLMError("unknown", "模型请求失败，请稍后再试。"),
                         event.usage,
                     )
+
+    def _start_manual_compact(self) -> None:
+        """在空闲状态启动一次不进入普通对话的强制压缩。"""
+
+        self.query_one("#conversation", RichLog).write(Text("❯ /compact", style="bold cyan"))
+        input_widget = self.query_one("#message-input", MessageInput)
+        input_widget.load_text("")
+        input_widget.disabled = True
+        self.turn_start = time.monotonic()
+        self.spinner_index = 0
+        self.current_iteration = 0
+        self.max_iterations = 0
+        self.task_usage = TokenUsage(0, 0)
+        self.task_usage_committed = False
+        self.session_state = SessionState.STREAMING
+        self._update_timer()
+        self.timer = self.set_interval(0.1, self._update_timer)
+        self.stream_worker = self.run_worker(
+            self._consume_manual_compact(),
+            name="context-compact",
+            exclusive=True,
+            exit_on_error=False,
+        )
+
+    async def _consume_manual_compact(self) -> None:
+        if self.agent is None:
+            self._finish_with_error(LLMError("unknown", "当前没有可用的 Provider。"))
+            return
+        try:
+            async for event in self.agent.compact_context():
+                if event.compact is not None:
+                    self._write_compact_event(event.compact)
+        except asyncio.CancelledError:
+            self._finish_with_status("上下文压缩已取消。", "bold yellow")
+            return
+        self._stop_turn()
+
+    def _write_compact_event(self, event) -> None:
+        """把压缩过程转换为可观察且不泄露内部 Prompt 的状态行。"""
+
+        if event.phase == "auto_start":
+            text = f"● 正在压缩上下文…（约 {event.before_tokens} Token）"
+            style = "bold cyan"
+        elif event.phase in {"auto_complete", "manual_complete"}:
+            text = f"● 上下文压缩完成：{event.before_tokens} → {event.after_tokens} Token"
+            style = "bold green"
+        elif event.phase in {"auto_failed", "manual_failed"}:
+            text = f"● 上下文压缩失败：{event.message or '未知原因'}"
+            style = "bold yellow"
+        else:
+            text = f"● {event.message or '自动上下文压缩已熔断。'}"
+            style = "bold yellow"
+        self.query_one("#conversation", RichLog).write(Text(text, style=style))
 
     def _write_tool_result(self, result: ToolResult) -> None:
         """按结果类型显示成功、错误、取消或状态未知。"""
@@ -693,6 +764,8 @@ class DragonCodeApp(App):
             ("Plan Mode 中规划任务\n", "dim"),
             ("  /do             ", "cyan"),
             ("执行已确认的计划\n", "dim"),
+            ("  /compact        ", "cyan"),
+            ("立即压缩当前对话上下文\n", "dim"),
             ("\n快捷键：\n", "bold cyan"),
             ("  Enter           ", "cyan"),
             ("提交消息\n", "dim"),

@@ -20,6 +20,8 @@ class ProviderConfig:
     model: str
     base_url: str | None = None
     thinking: bool = False
+    context_window: int = 128_000
+    summary_model: str | None = None
 
 
 @dataclass
@@ -160,6 +162,17 @@ class LLMEvent:
 
 
 @dataclass
+class CompactEvent:
+    """上下文压缩过程向界面公开的安全状态。"""
+
+    phase: str
+    before_tokens: int | None = None
+    after_tokens: int | None = None
+    offloaded_results: int = 0
+    message: str = ""
+
+
+@dataclass
 class AgentEvent:
     """Agent 发送给 TUI 的协议无关事件。"""
 
@@ -172,3 +185,4 @@ class AgentEvent:
     max_iterations: int = 0
     error: Exception | None = None
     permission_request: PermissionRequest | None = None
+    compact: CompactEvent | None = None

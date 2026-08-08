@@ -53,10 +53,10 @@ async def test_bash_timeout(tmp_path):
     assert result.error_code == "timeout"
 
 
-async def test_bash_truncates_long_output(tmp_path):
+async def test_bash_returns_complete_long_output(tmp_path):
     result = await BashTool(tmp_path).execute(
         ToolCall("1", "Bash", {"command": python_command("print('x'*100100)")})
     )
     assert result.success
-    assert result.truncated
-    assert len(result.metadata["stdout"]) <= 100_000
+    assert result.truncated is False
+    assert len(result.metadata["stdout"].strip()) == 100_100

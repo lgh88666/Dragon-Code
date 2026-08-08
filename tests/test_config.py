@@ -32,6 +32,8 @@ providers:
     assert len(config.providers) == 1
     assert config.providers[0].protocol == "anthropic"
     assert config.providers[0].thinking is True
+    assert config.providers[0].context_window == 200_000
+    assert config.providers[0].summary_model is None
     assert "secret-value" not in repr(config.providers[0])
 
 
@@ -56,6 +58,67 @@ providers:
 
     assert len(config.providers) == 2
     assert config.providers[1].base_url == "https://example.com/v1"
+    assert config.providers[1].context_window == 128_000
+
+
+def test_provider_context_window_and_summary_model(tmp_path: Path):
+    path = write_config(
+        tmp_path / "config.yaml",
+        """
+providers:
+  - name: DeepSeek
+    protocol: openai
+    api_key: secret-value
+    model: deepseek-v4-pro
+    context_window: 256000
+    summary_model: deepseek-v4-flash
+""",
+    )
+
+    provider = load_config(str(path)).providers[0]
+
+    assert provider.context_window == 256_000
+    assert provider.summary_model == "deepseek-v4-flash"
+
+
+@pytest.mark.parametrize("yaml_value", ["0", "-1", "true", "1.5", "'128000'"])
+def test_invalid_context_window(tmp_path: Path, yaml_value: str):
+    path = write_config(
+        tmp_path / "config.yaml",
+        "\n".join(
+            [
+                "providers:",
+                "  - name: Demo",
+                "    protocol: openai",
+                "    api_key: k",
+                "    model: m",
+                f"    context_window: {yaml_value}",
+            ]
+        ),
+    )
+
+    with pytest.raises(ConfigError, match=r"providers\[0\]\.context_window"):
+        load_config(str(path))
+
+
+@pytest.mark.parametrize("value", ["''", "'   '", "[]", "false"])
+def test_invalid_summary_model(tmp_path: Path, value: str):
+    path = write_config(
+        tmp_path / "config.yaml",
+        "\n".join(
+            [
+                "providers:",
+                "  - name: Demo",
+                "    protocol: openai",
+                "    api_key: k",
+                "    model: m",
+                f"    summary_model: {value}",
+            ]
+        ),
+    )
+
+    with pytest.raises(ConfigError, match=r"providers\[0\]\.summary_model"):
+        load_config(str(path))
 
 
 @pytest.mark.parametrize(

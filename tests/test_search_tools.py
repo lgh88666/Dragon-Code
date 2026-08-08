@@ -43,7 +43,7 @@ async def test_grep_empty_and_invalid_pattern(tmp_path):
     assert outside.error_code == "path_outside_workspace"
 
 
-async def test_search_results_are_limited_and_skip_git(tmp_path):
+async def test_search_results_are_complete_and_skip_git(tmp_path):
     for index in range(205):
         (tmp_path / f"{index:03}.txt").write_text("needle", encoding="utf-8")
     hidden = tmp_path / ".git"
@@ -52,6 +52,8 @@ async def test_search_results_are_limited_and_skip_git(tmp_path):
 
     glob_result = await GlobTool(tmp_path).execute(ToolCall("1", "Glob", {"pattern": "**/*.txt"}))
     grep_result = await GrepTool(tmp_path).execute(ToolCall("2", "Grep", {"pattern": "needle"}))
-    assert glob_result.truncated and len(glob_result.content.splitlines()) == 200
-    assert grep_result.truncated and len(grep_result.content.splitlines()) == 200
+    assert glob_result.truncated is False
+    assert len(glob_result.content.splitlines()) == 206
+    assert grep_result.truncated is False
+    assert len(grep_result.content.splitlines()) == 205
     assert ".git" not in grep_result.content

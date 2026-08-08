@@ -12,6 +12,12 @@ class ConfigError(Exception):
     """配置文件不符合要求时抛出的可读错误。"""
 
 
+DEFAULT_CONTEXT_WINDOWS = {
+    "anthropic": 200_000,
+    "openai": 128_000,
+}
+
+
 def _require_text(item: dict[str, Any], field_name: str, location: str) -> str:
     """读取一个必填字符串，并生成包含字段位置的错误。"""
 
@@ -44,6 +50,18 @@ def _parse_provider(raw: Any, index: int) -> ProviderConfig:
     if not isinstance(thinking, bool):
         raise ConfigError(f"{location}.thinking 必须是 true 或 false")
 
+    context_window = raw.get("context_window", DEFAULT_CONTEXT_WINDOWS[protocol])
+    if isinstance(context_window, bool) or not isinstance(context_window, int):
+        raise ConfigError(f"{location}.context_window 必须是正整数")
+    if context_window <= 0:
+        raise ConfigError(f"{location}.context_window 必须是正整数")
+
+    summary_model = raw.get("summary_model")
+    if summary_model is not None:
+        if not isinstance(summary_model, str) or not summary_model.strip():
+            raise ConfigError(f"{location}.summary_model 必须是非空字符串或省略")
+        summary_model = summary_model.strip()
+
     return ProviderConfig(
         name=name,
         protocol=protocol,
@@ -51,6 +69,8 @@ def _parse_provider(raw: Any, index: int) -> ProviderConfig:
         model=model,
         base_url=base_url.strip() if isinstance(base_url, str) else None,
         thinking=thinking,
+        context_window=context_window,
+        summary_model=summary_model,
     )
 
 

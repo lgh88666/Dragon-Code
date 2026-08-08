@@ -173,7 +173,7 @@ async def test_execute_times_out(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.mark.asyncio
-async def test_execute_truncates_long_result():
+async def test_execute_keeps_complete_long_result():
     result = CallToolResult(content=[TextContent(text="x" * 100_100)])
     tool = adapt_tool("local", remote_tool(), FakeCaller(result))
     assert tool is not None
@@ -181,9 +181,8 @@ async def test_execute_truncates_long_result():
     value = await tool.execute(call())
 
     assert value.success is True
-    assert value.truncated is True
-    assert len(value.content) == 100_000
-    assert value.content.endswith("[truncated]")
+    assert value.truncated is False
+    assert value.content == "x" * 100_100
 
 
 @pytest.mark.asyncio
