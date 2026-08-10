@@ -2,7 +2,7 @@
 
 ## 结论
 
-ch08 两层上下文管理已完成实现并通过自动化与真实 DeepSeek 验收。
+ch08 两层上下文管理已完成实现，并通过自动化、真实 DeepSeek 与 WSL tmux 端到端验收。
 
 - 轻量预防：单条工具结果超过50000 UTF-8字节时完整落盘；同轮剩余结果合计超过200000字节时稳定选择最少结果落盘。
 - 重量兜底：普通请求接近窗口时使用专用摘要模型生成九部分结构化摘要，保留近期原文并继续当前任务。
@@ -72,11 +72,47 @@ manual_after=206
 
 本次自动触发场景用超大工具定义制造窗口压力，历史本身很短，因此摘要后估算由20335变为20570，并不代表长历史压缩率。该场景验证的是触发、模型选择、消息保真和继续执行；近期原文裁剪与实际缩短由确定性单元测试覆盖。
 
+## WSL tmux 补充验收
+
+执行日期：2026-08-10；环境：WSL Ubuntu、tmux 3.6、Linux Python 3.14.4、真实 `deepseek-v4-pro`。WSL 使用 `/tmp` 中的独立运行依赖读取同一份源码和本地配置，没有把 API Key 写入命令、报告或 Git。
+
+实际观察：
+
+```text
+tmux_session=dragon-ch08
+main_model=deepseek-v4-pro
+permission=allow_once
+source_lines=6000
+source_last_line=DRAGON_5999
+offloaded=true
+saved_bytes=113999
+saved_lines=6000
+saved_path=.dragon-code/sessions/1786348387-74e526f1/tool-results/tool-call_00_YdOLSLLOjro8W5o6Daif0531-0adf94b399df.txt
+reread_offset=5995
+reread_limit=6
+reread_last_line=DRAGON_5999
+manual_compact_before=2569
+manual_compact_after=3222
+post_compact_context_preserved=true
+dragon_process_after_exit=0
+session_result_after_exit=true
+```
+
+对应结论：
+
+1. 在 tmux 中启动真实 Dragon Code，TUI 正常显示 Dragon Banner、模型、Token 和权限确认界面。
+2. Bash 调用只选择“允许本次”，随后 Read 完整读取 6000 行文件；113999 字节结果被统一落盘，TUI 只显示预览、原始字节数、行数和保存路径。
+3. 真实模型读取预览后主动调用 Read，参数为 `offset=5995`、`limit=6`，从落盘结果恢复尾部并回答 `DRAGON_5999`。
+4. 在同一会话执行 `/compact`，TUI 显示 `上下文压缩完成：2569 → 3222 Token`。该短历史场景因九部分摘要开销而变大，符合“手动压缩不受阈值限制”的设计；随后模型仍能回答保存路径和最后一行，证明会话可继续。
+5. `/exit` 后 tmux pane 回到 Bash，没有残留 `python3 -m dragon_code` 进程；会话目录及113999字节结果仍存在。验收生成的项目根目录临时输入文件已删除。
+
+自动摘要模型选择、自动压缩后继续主任务由上面的真实 DeepSeek 核心链路证据覆盖；三次失败熔断与手动绕过继续由可控自动化测试覆盖，没有伪装成 tmux 人工场景。
+
 ## 设计调整记录
 
 - 审批文档原聚合示例“三个80000字节只落盘一个”与单条超过50000字节规则冲突。用户选择A后，统一改为“五个45000字节只落盘一个”。
 - 真实验收发现整体重读大结果会再次触发落盘。为完成“可恢复”目标，Read 增加向后兼容的 `offset`/`limit` 行分页，Spec、Plan、Task和Checklist已同步。
-- 当前机器没有WSL/tmux，真实验收明确记录为Windows等价链路。
+- 2026-08-08 的原验收机器没有WSL/tmux，因此当时明确记录为Windows等价链路；2026-08-10 已在另一台机器补齐真实 WSL tmux 证据。
 
 ## 明确未实现
 

@@ -18,8 +18,8 @@
 - 已完成：ch02–ch08。
 - 最近完成模块：ch08 上下文管理。
 - ch07 实现提交：`9b0d901 feat: add MCP client integration`。
-- 当前功能代码已经推送到 GitHub。
-- ch08 实现与文档位于同一完成提交；未推送前只存在于本机。
+- ch08 实现提交：`97d3cd7 feat: add ch08 context management`。
+- 当前功能代码已经推送到 GitHub，并在另一台电脑拉取同步。
 - 下一开发章节开始前，继续执行理论学习与四文档审批硬门槛。
 
 ## 已有能力
@@ -143,7 +143,8 @@ ch08 完成时的证据：
 - 121911字节结果完整保存在L盘，真实主模型通过Read分页确认尾部标记。
 - 自动摘要后当前消息保留且主任务继续；低Token `/compact` 成功。
 - 自动连续失败三次熔断和手动绕过由可控自动化测试验证。
-- 本机没有WSL/tmux，真实证据使用Windows等价链路并在报告中明确说明。
+- 2026-08-10 已补真实 WSL tmux：113999字节结果落盘、模型按 `offset=5995`/`limit=6` 重读并回答 `DRAGON_5999`。
+- 同一 tmux 会话中 `/compact` 成功，压缩后模型仍能引用保存路径和尾部；`/exit` 后无残留 Dragon Code 进程且结果文件保留。
 
 完整证据见 `specs/ch08-context-management/acceptance-report.md`。
 
