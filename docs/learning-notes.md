@@ -534,6 +534,68 @@ LLM Client 中，统一用量对象最终暴露输入、输出、缓存写入、
 > OpenAI Client 保持稳定前缀。Plan Mode 约束通过不持久化的 system-reminder 按轮注入，
 > 既不污染历史，也不会破坏工具结果配对。最后通过真实缓存读取 Token 验证了前缀复用。
 
+## ch09：项目记忆与会话持久化
+
+### 模块目标
+
+- **项目指令**：启动时把项目约定加载进系统提示，让模型先知道“这个项目怎么做”。
+- **会话存档**：每产生一条完整消息就追加到 JSONL，让异常退出最多影响最后一条记录。
+- **会话恢复**：`/resume` 扫描本地会话，修复坏行和悬空工具调用后继续原会话。
+- **自动记忆**：自然完成后按条件后台提取长期知识，让新会话也能使用用户偏好和项目知识。
+
+### 核心调用链
+
+```text
+CLI 启动
+  → InstructionLoader 加载三层 DRAGON.md
+  → SessionManager 创建本次 JSONL Writer
+  → MemoryManager 加载两层 MEMORY.md
+  → Agent 把项目指令和记忆索引放进系统提示
+  → Conversation 每次追加完整消息时通知 SessionWriter
+  → Agent 自然完成后按关键词/五轮节奏触发后台记忆
+
+/resume
+  → SessionManager 扫描会话元数据
+  → SessionReader 跳过坏行并截断悬空 ToolCall
+  → 必要时 ContextManager 压缩一次
+  → TUI 原子替换 Conversation、ContextManager 和 Writer
+  → 后续消息继续写入原 JSONL
+```
+
+### 值得记住的设计
+
+1. **每行一个 JSON 对象**：这里的“每行”是 JSONL 文件中的一条物理文本行，一行代表一条完整会话记录，不是聊天内容里的自然段。
+2. **`tool_use_id` 用于配对**：assistant 发出的 ToolCall 和工具结果必须使用同一个调用 ID，恢复时才能判断调用是否完整。
+3. **先写磁盘再更新内存**：只有持久化成功后才把记录视为可靠，避免界面认为已保存但崩溃后文件里没有；Dragon Code 写入失败时会提示“本轮未能保存”，主对话仍继续。
+4. **`hidden_blocks` 不是多余字段**：它保存 provider 后续请求仍需要、但不向用户展示的协议内容，恢复后才能尽量还原合法请求。
+5. **坏数据只影响局部**：坏 JSON 按行跳过；末尾 ToolCall 没有结果时从对应 assistant 开始截断，避免下一次请求因悬空调用返回 400。
+6. **自动记忆是 Markdown，不是 YAML**：每条笔记是带 YAML frontmatter 的 Markdown；`MEMORY.md` 是可注入系统提示的索引。
+7. **后台更新不等于后台改代码**：记忆请求不携带工具定义，只允许模型返回结构化的增删改操作，再由本地管理器校验和写文件。
+
+### 核心源码入口
+
+| 文件 | 阅读重点 |
+|---|---|
+| `instructions/loader.py` | include 深度、环路和越界为什么要同时检查 |
+| `sessions/codec.py` | ChatMessage、ToolCall、ToolResult 如何完整往返 JSON |
+| `sessions/writer.py` | append、flush/fsync、锁和 close 幂等 |
+| `sessions/reader.py` | 坏行、compact 边界和悬空工具调用修复 |
+| `sessions/manager.py` | 新建、列表、恢复、6 小时提醒和 45 天清理 |
+| `memory/manager.py` | 触发、后台 LLM、原子写入和索引重建 |
+| `tui.py` | `/resume` 状态互斥与成功/失败的原子切换 |
+
+### 测试与证据
+
+- 全量自动化：`369 passed, 2 skipped`。
+- 真实 tmux：Read 工具会话完整落盘，`/resume` 后能引用前文。
+- 跨会话记忆：新会话正确回答验收代号 `CH09-BLUE-DRAGON`。
+- 异常恢复：坏行和悬空 ToolCall 被提示并修复，后续对话返回 `OK`。
+- 退出清理：`DRAGON_PROCESS_COUNT=0`。
+
+### 面试表达
+
+> 我把短期历史和长期知识分成三层：项目指令在启动时安全加载，会话用追加式 JSONL 保证崩溃可恢复，长期记忆用分类 Markdown 和受控索引跨会话注入。恢复时会跳过坏行、截断悬空工具调用并原子切换运行状态；自动记忆则使用无工具的后台模型请求和原子文件替换，既不阻塞 Agent Loop，也不会让后台模型直接操作文件系统。
+
 ## 每章源码回顾模板
 
 ### chXX：[模块名称]

@@ -34,3 +34,11 @@ def test_duplicate_registration_is_rejected(tmp_path):
 async def test_unknown_tool_is_a_result():
     result = await ToolRegistry().execute(ToolCall("1", "Missing", {}))
     assert result.error_code == "unknown_tool"
+
+
+def test_registry_passes_extra_read_roots_only_to_read(tmp_path):
+    memory = tmp_path / "memory"
+    registry = create_default_registry(tmp_path, [memory])
+
+    assert registry.get("Read").extra_read_roots == [memory.resolve()]
+    assert not hasattr(registry.get("Write"), "extra_read_roots")

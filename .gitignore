@@ -11,5 +11,6 @@ htmlcov/
 .dragon-code/config.yaml
 .dragon-code/settings.local.yaml
 .dragon-code/sessions/
+.dragon-code/memory/
 .env
 .env.*

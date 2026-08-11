@@ -127,3 +127,24 @@ async def test_symlink_cannot_escape_workspace(tmp_path):
         if link.exists() or os.path.lexists(link):
             link.unlink()
         outside.unlink()
+
+
+async def test_read_can_use_extra_memory_root_but_other_tools_cannot(tmp_path):
+    project = tmp_path / "project"
+    memory = tmp_path / "home" / ".dragon-code" / "memory"
+    project.mkdir()
+    memory.mkdir(parents=True)
+    note = memory / "user_preference_short.md"
+    note.write_text("remember-short", encoding="utf-8")
+
+    read_result = await ReadTool(project, [memory]).execute(
+        ToolCall("1", "Read", {"path": str(note)})
+    )
+    write_result = await WriteTool(project).execute(
+        ToolCall("2", "Write", {"path": str(note), "content": "changed"})
+    )
+
+    assert read_result.success is True
+    assert "remember-short" in read_result.content
+    assert write_result.error_code == "path_outside_workspace"
+    assert note.read_text(encoding="utf-8") == "remember-short"

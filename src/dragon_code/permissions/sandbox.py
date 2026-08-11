@@ -80,8 +80,15 @@ def _resolve_new_path(candidate: Path) -> Path:
 class PathSandbox:
     """确保文件与搜索路径解析后仍在单一项目根内。"""
 
-    def __init__(self, project_root: Path):
+    def __init__(
+        self,
+        project_root: Path,
+        extra_read_roots: list[Path] | None = None,
+    ):
         self.project_root = project_root.resolve(strict=True)
+        self.extra_read_roots = [
+            root.expanduser().resolve(strict=False) for root in extra_read_roots or []
+        ]
 
     def check(self, call: ToolCall) -> PermissionResult | None:
         target = extract_target(call)
@@ -99,7 +106,19 @@ class PathSandbox:
                 if candidate.exists()
                 else _resolve_new_path(candidate)
             )
-            resolved.relative_to(self.project_root)
+            allowed_roots = [self.project_root]
+            if call.name == "Read":
+                allowed_roots.extend(self.extra_read_roots)
+            if not any(_is_relative_to(resolved, root) for root in allowed_roots):
+                raise ValueError("目标超出允许根目录")
         except (OSError, RuntimeError, ValueError):
             return _deny("目标路径解析后超出项目根目录，工具不会执行。")
         return None
+
+
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False

@@ -273,6 +273,39 @@ class ContextManager:
             self.usage_anchor.invalidate()
         return outcome
 
+    def restored_history_needs_compaction(
+        self,
+        history: list[ChatMessage],
+        system: SystemPrompt,
+        tools: list[ToolDefinition],
+    ) -> bool:
+        """判断恢复历史是否已经达到自动压缩阈值。"""
+
+        request = LLMRequest(
+            messages=copy.deepcopy(history),
+            tools=list(tools),
+            system=system,
+        )
+        should_compact, _estimated, _tripped = self.auto_compact_status(request)
+        return should_compact
+
+    async def compact_restored_history(
+        self,
+        history: list[ChatMessage],
+    ) -> CompactOutcome:
+        """恢复阶段只尝试一次压缩，不累计自动熔断次数。"""
+
+        before_tokens = math.ceil(len(serialize_messages(history)) / CHARS_PER_TOKEN)
+        outcome = await self._compact_history(
+            copy.deepcopy(history),
+            reason="restore",
+            before_tokens=before_tokens,
+            safety_margin=AUTO_SAFETY_MARGIN,
+        )
+        if outcome.success:
+            self.usage_anchor.invalidate()
+        return outcome
+
     def cancel_active(self) -> None:
         """取消当前摘要网络等待。"""
 

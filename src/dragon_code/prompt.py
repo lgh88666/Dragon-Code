@@ -127,7 +127,7 @@ def optional_prompt_modules(
     active_skills: str = "",
     memory: str = "",
 ) -> list[PromptModule]:
-    """返回预留模块；本章没有真实的内容来源。"""
+    """返回可选模块；项目指令和长期记忆由 ch09 提供真实来源。"""
 
     return [
         PromptModule("自定义指令", 80, custom_instructions),

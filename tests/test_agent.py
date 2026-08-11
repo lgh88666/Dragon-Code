@@ -969,3 +969,112 @@ async def test_agent_accumulates_cache_usage():
     events = await collect(agent)
 
     assert events[-1].usage == TokenUsage(15, 3, 30, 30)
+
+
+class RecordingMemoryManager:
+    def __init__(self, index="remembered preference"):
+        self.index = index
+        self.calls = []
+
+    def current_index(self):
+        return self.index
+
+    def schedule_update(self, client, turn_messages, completed_turns, user_text):
+        self.calls.append((client, turn_messages, completed_turns, user_text))
+
+
+async def test_agent_injects_custom_instructions_and_current_memory(tmp_path):
+    client = SequenceClient([response("完成")])
+    memory = RecordingMemoryManager()
+    agent = make_agent(
+        client,
+        working_dir=tmp_path,
+        custom_instructions="project instruction",
+        memory_manager=memory,
+    )
+
+    events = await collect(agent, "执行")
+
+    assert events[-1].type == "completed"
+    assert "project instruction" in client.requests[0].system.stable
+    assert "remembered preference" in client.requests[0].system.stable
+
+
+async def test_natural_completion_schedules_memory_with_turn_snapshot(tmp_path):
+    client = SequenceClient([response("完成")])
+    memory = RecordingMemoryManager()
+    agent = make_agent(client, working_dir=tmp_path, memory_manager=memory)
+
+    await collect(agent, "请记住偏好")
+
+    assert agent.completed_turns == 1
+    assert len(memory.calls) == 1
+    _client, messages, turns, user_text = memory.calls[0]
+    assert [message.role for message in messages] == ["user", "assistant"]
+    assert turns == 1
+    assert user_text == "请记住偏好"
+
+
+async def test_error_and_limit_do_not_schedule_memory(tmp_path):
+    memory = RecordingMemoryManager()
+    error_agent = make_agent(
+        SequenceClient([LLMError("network", "error")]),
+        working_dir=tmp_path,
+        memory_manager=memory,
+    )
+    await collect(error_agent)
+
+    tool = DemoTool()
+    limit_agent = make_agent(
+        SequenceClient([response(calls=[ToolCall("1", "Demo", {})])]),
+        registry=registry_with(tool),
+        working_dir=tmp_path,
+        memory_manager=memory,
+        max_iterations=1,
+    )
+    await collect(limit_agent)
+
+    assert memory.calls == []
+
+
+async def test_persistence_warning_is_event_and_reply_still_completes(tmp_path):
+    def fail(_message):
+        raise OSError("disk full")
+
+    conversation = Conversation(on_append=fail)
+    agent = make_agent(
+        SequenceClient([response("正常回复")]),
+        conversation=conversation,
+        working_dir=tmp_path,
+    )
+
+    events = await collect(agent)
+
+    assert [event.type for event in events[-2:]] == ["session_warning", "completed"]
+    assert events[-2].text == "本轮未能保存"
+    assert conversation.get_messages()[-1].content == "正常回复"
+
+
+def test_replace_session_resets_plan_and_recounts_turns(tmp_path):
+    agent = make_agent(
+        SequenceClient([]),
+        working_dir=tmp_path,
+    )
+    agent.enter_plan_mode()
+    agent.has_plan = True
+    conversation = Conversation(
+        initial_messages=[
+            ChatMessage("user", "one"),
+            ChatMessage("assistant", "answer"),
+            ChatMessage("user", "two"),
+        ]
+    )
+    context = ContextManager(tmp_path, session_id="20260811-120000-abcd")
+
+    agent.replace_session(conversation, context)
+
+    assert agent.conversation is conversation
+    assert agent.context_manager is context
+    assert agent.completed_turns == 2
+    assert agent.mode is PermissionMode.DEFAULT
+    assert agent.has_plan is False

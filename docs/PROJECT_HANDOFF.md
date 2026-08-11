@@ -15,11 +15,11 @@
 
 ## 当前状态
 
-- 已完成：ch02–ch08。
-- 最近完成模块：ch08 上下文管理。
+- 已完成：ch02–ch09。
+- 最近完成模块：ch09 项目记忆与会话持久化。
 - ch07 实现提交：`9b0d901 feat: add MCP client integration`。
 - ch08 实现提交：`97d3cd7 feat: add ch08 context management`。
-- 当前功能代码已经推送到 GitHub，并在另一台电脑拉取同步。
+- ch02–ch08 功能代码已经推送到 GitHub；ch09 已完成本地验收，等待用户明确要求后再推送。
 - 下一开发章节开始前，继续执行理论学习与四文档审批硬门槛。
 
 ## 已有能力
@@ -79,6 +79,15 @@
 - 主模型和摘要模型使用同协议、Key、base_url的独立Client；本机摘要模型为 `deepseek-v4-flash`。
 - `/compact` 手动压缩、自动失败三次熔断、失败保留原历史并继续主请求。
 
+### ch09：项目记忆与会话持久化
+
+- 三层 `DRAGON.md` 项目指令加载和安全 `@include`，含深度、环路、边界与编码保护。
+- 会话消息按 JSONL 追加保存，完整保留工具调用、工具结果和隐藏协议块。
+- `/resume` 本地会话列表、搜索、坏行跳过、悬空调用截断、原会话续写和失败回滚。
+- 新格式会话 45 天过期清理，旧格式数据不展示也不自动删除。
+- 用户偏好、纠正反馈、项目知识、参考资料四类自动记忆，项目级和用户级分离。
+- `MEMORY.md` 索引注入模型上下文；后台使用当前 LLMClient 更新，不阻塞主对话。
+
 ## 当前核心调用链
 
 ```text
@@ -103,6 +112,8 @@ ToolResult 写回 Conversation
 ContextManager 统一落盘预防、Token估算和可选结构化摘要
   ↓
 Agent 进入下一轮，直到最终文本或停止条件
+  ↓
+SessionWriter 追加完整消息；MemoryManager 在自然完成后按条件后台更新
   ↓
 TUI 通过 AgentEvent 实时展示文本、工具行、结果和状态
 ```
@@ -129,8 +140,26 @@ TUI 通过 AgentEvent 实时展示文本、工具行、结果和状态
 | `src/dragon_code/context/state.py` | 会话路径、冻结账本、usage锚点和熔断状态 |
 | `src/dragon_code/context/summary.py` | 摘要Prompt、解析、近期原文边界和新历史纯函数 |
 | `src/dragon_code/context/manager.py` | 工具结果落盘、Token估算、自动/手动压缩协调 |
+| `src/dragon_code/instructions/loader.py` | 三层项目指令和安全 include 加载 |
+| `src/dragon_code/sessions/manager.py` | 会话创建、列表、恢复、修复和 45 天清理 |
+| `src/dragon_code/sessions/writer.py` | JSONL 串行追加、刷盘和压缩边界写入 |
+| `src/dragon_code/sessions/reader.py` | JSONL 扫描、坏行跳过和悬空调用截断 |
+| `src/dragon_code/memory/manager.py` | 自动记忆调度、模型更新、原子文件写入和索引重建 |
 
 ## 最近验证状态
+
+ch09 完成时的证据：
+
+- `uv sync --locked`：57 个包检查通过。
+- `uv run ruff format --check .`：141 个文件已格式化。
+- `uv run ruff check .`：通过。
+- `uv run pytest -q`：`369 passed, 2 skipped`。
+- 性能：指令加载平均 0.910ms；会话追加中位数 0.195ms、最大 1.299ms；扫描 50 个会话 12.967ms。
+- WSL tmux + 真实 DeepSeek：Read 工具调用完整写入 JSONL，`/resume` 搜索并恢复后能引用前文。
+- 明确“记住”后自动生成项目记忆；新会话无需读文件即可回答 `CH09-BLUE-DRAGON`。
+- 含坏行和悬空 ToolCall 的会话被跳过/截断后仍可继续对话；`/exit` 后进程数为 0。
+
+完整证据见 `specs/ch09-memory-session/acceptance-report.md`。
 
 ch08 完成时的证据：
 
@@ -167,9 +196,10 @@ ch07 完成时的证据：
 
 ## 学习与回顾状态
 
-- `docs/learning-notes.md` 已系统整理 ch02、ch03、聊天历史复制和 ch05。
+- `docs/learning-notes.md` 已系统整理 ch02、ch03、聊天历史复制、ch05，并补充 ch09 核心源码回顾入口。
 - ch06 已进行过对话式核心回顾，但尚未整理成独立的完整学习笔记章节。
-- ch07 功能已经开发和验收，核心源码回顾与学习笔记仍待进行。
+- ch07、ch08 功能已经开发和验收，完整源码学习笔记仍可按需补充。
+- ch09 已完成开发与验收，下一步安排一次聚焦核心调用链的源码回顾。
 - 后续回顾只聚焦核心调用链、关键类型、边界、测试和面试表达，不逐文件啃完所有源码。
 - 用户说“记一下”时，应立即把对应知识补入 `docs/learning-notes.md`。
 
@@ -243,8 +273,8 @@ uv run python -m dragon_code
 
 推荐顺序：
 
-1. 回顾 ch08 核心源码：`context/state.py → summary.py → manager.py → agent.py → tui.py`。
-2. 将ch08上下文管理的核心调用链和面试表达补入 `docs/learning-notes.md`。
+1. 回顾 ch09 核心源码：指令加载 → JSONL 会话 → `/resume` → 自动记忆。
+2. 只精读 `instructions/loader.py`、`sessions/manager.py`、`memory/manager.py` 与它们在 `cli.py`/`agent.py`/`tui.py` 的接线。
 3. 学习下一章理论内容。
 4. 按 `AGENTS.md` 的四文档流程启动下一章开发。
 

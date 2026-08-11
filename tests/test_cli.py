@@ -28,8 +28,10 @@ async def test_run_app_starts_mcp_before_tui_and_always_closes(monkeypatch):
             events.append("manager-close")
 
     class FakeApp:
-        def __init__(self, config, registry):
+        def __init__(self, config, registry, **services):
             assert registry is not None
+            assert services["session_manager"] is not None
+            assert services["memory_manager"] is not None
             events.append("app-create")
 
         async def run_async(self):
@@ -72,8 +74,8 @@ async def test_run_app_closes_mcp_when_tui_fails(monkeypatch):
             closed = True
 
     class BrokenApp:
-        def __init__(self, config, registry):
-            pass
+        def __init__(self, config, registry, **services):
+            assert services["custom_instructions"] == ""
 
         async def run_async(self):
             raise RuntimeError("TUI failed")

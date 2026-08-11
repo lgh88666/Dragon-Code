@@ -19,7 +19,7 @@ from textual.screen import ModalScreen
 from textual.selection import Selection
 from textual.strip import Strip
 from textual.timer import Timer
-from textual.widgets import OptionList, RichLog, Static, TextArea
+from textual.widgets import Input, OptionList, RichLog, Static, TextArea
 from textual.worker import Worker
 
 from dragon_code import __version__
@@ -27,6 +27,7 @@ from dragon_code.agent import Agent
 from dragon_code.clients.base import LLMClient, LLMError
 from dragon_code.clients.factory import create_llm_client
 from dragon_code.context.manager import ContextManager
+from dragon_code.memory import MemoryManager
 from dragon_code.models import (
     AppConfig,
     ProviderConfig,
@@ -34,12 +35,12 @@ from dragon_code.models import (
     ToolCall,
     ToolResult,
 )
-from dragon_code.permissions import ApprovalChoice, PermissionMode, PermissionRequest
+from dragon_code.permissions import ApprovalChoice, PathSandbox, PermissionMode, PermissionRequest
 from dragon_code.permissions.approval import ApprovalController
 from dragon_code.permissions.engine import PermissionEngine
 from dragon_code.permissions.rules import RuleStore
-from dragon_code.prompt import DO_PLAN_PROMPT, render_banner
-from dragon_code.session import Conversation
+from dragon_code.prompt import DO_PLAN_PROMPT, build_system_prompt, render_banner
+from dragon_code.sessions import ActiveSession, SessionInfo, SessionManager
 from dragon_code.tools import ToolRegistry, create_default_registry
 
 
@@ -87,6 +88,7 @@ class SessionState(Enum):
     IDLE = "idle"
     STREAMING = "streaming"
     APPROVING = "approving"
+    RESUMING = "resuming"
 
 
 class ConversationLog(RichLog):
@@ -173,6 +175,82 @@ class ProviderSelectScreen(ModalScreen[int]):
     def submit_highlighted(self) -> None:
         options = self.query_one("#provider-options", OptionList)
         self.dismiss(options.highlighted or 0)
+
+
+class SessionResumeScreen(ModalScreen[str | None]):
+    """搜索并选择一个本地历史会话。"""
+
+    BINDINGS = [Binding("escape", "cancel", show=False, priority=True)]
+
+    def __init__(self, sessions: list[SessionInfo]):
+        super().__init__()
+        self.sessions = sessions
+        self.filtered = list(sessions)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="resume-dialog"):
+            yield Static("恢复历史会话", id="resume-title")
+            yield Input(placeholder="按标题或会话 ID 搜索…", id="resume-search")
+            yield OptionList(*self._labels(self.filtered), id="resume-options")
+
+    def on_mount(self) -> None:
+        self.query_one("#resume-search", Input).focus()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        keyword = event.value.strip().lower()
+        self.filtered = [
+            session
+            for session in self.sessions
+            if not keyword
+            or keyword in session.title.lower()
+            or keyword in session.session_id.lower()
+        ]
+        options = self.query_one("#resume-options", OptionList)
+        options.clear_options()
+        options.add_options(self._labels(self.filtered) or ["没有匹配的会话"])
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        if event.option_index < len(self.filtered):
+            self.dismiss(self.filtered[event.option_index].session_id)
+
+    def submit_highlighted(self) -> None:
+        options = self.query_one("#resume-options", OptionList)
+        index = options.highlighted or 0
+        if index < len(self.filtered):
+            self.dismiss(self.filtered[index].session_id)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    @staticmethod
+    def _labels(sessions: list[SessionInfo]) -> list[str]:
+        now = time.time()
+        return [
+            (
+                f"{session.title}  ·  {_relative_time(now, session.updated_at.timestamp())}"
+                f"  ·  {session.model}  ·  {_format_file_size(session.file_size)}"
+            )
+            for session in sessions
+        ]
+
+
+def _relative_time(now: float, timestamp: float) -> str:
+    seconds = max(0, int(now - timestamp))
+    if seconds < 60:
+        return "刚刚"
+    if seconds < 3600:
+        return f"{seconds // 60} 分钟前"
+    if seconds < 86400:
+        return f"{seconds // 3600} 小时前"
+    return f"{seconds // 86400} 天前"
+
+
+def _format_file_size(size: int) -> str:
+    if size < 1024:
+        return f"{size} B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f} KB"
+    return f"{size / (1024 * 1024):.1f} MB"
 
 
 class PermissionApprovalScreen(ModalScreen[ApprovalChoice | None]):
@@ -273,10 +351,20 @@ class DragonCodeApp(App):
         config: AppConfig,
         registry: ToolRegistry | None = None,
         client_factory: Callable[[ProviderConfig], LLMClient] = create_llm_client,
+        session_manager: SessionManager | None = None,
+        memory_manager: MemoryManager | None = None,
+        custom_instructions: str = "",
     ):
         super().__init__()
         self.config = config
-        self.registry = registry or create_default_registry(Path.cwd())
+        self.session_manager = session_manager or SessionManager(Path.cwd())
+        self.memory_manager = memory_manager
+        self.custom_instructions = custom_instructions
+        extra_read_roots = [memory_manager.user_memory_dir] if memory_manager is not None else []
+        self.registry = registry or create_default_registry(
+            self.session_manager.project_root,
+            extra_read_roots,
+        )
         self.client_factory = client_factory
         self.session_state = SessionState.SELECTING
         self.client: LLMClient | None = None
@@ -286,6 +374,8 @@ class DragonCodeApp(App):
         self.turn_start = 0.0
         self.timer: Timer | None = None
         self.stream_worker: Worker | None = None
+        self.resume_worker: Worker | None = None
+        self.active_session: ActiveSession | None = None
         self.spinner_index = 0
         self.current_iteration = 0
         self.max_iterations = 0
@@ -324,6 +414,11 @@ class DragonCodeApp(App):
             callback=self._provider_selected,
         )
 
+    def on_unmount(self) -> None:
+        """测试退出或终端关闭时也幂等释放会话文件。"""
+
+        self.session_manager.close()
+
     def _provider_selected(self, selected_index: int | None) -> None:
         """选择完成后创建本次会话使用的 Provider。"""
 
@@ -337,23 +432,34 @@ class DragonCodeApp(App):
         self.client = self.client_factory(config)
         summary_config = replace(config, model=config.summary_model or config.model)
         self.summary_client = self.client_factory(summary_config)
-        workdir = Path.cwd()
+        workdir = self.session_manager.project_root
         rule_store = RuleStore.load(workdir)
+        self.active_session = self.session_manager.open_new(config.model)
         context_manager = ContextManager(
             workdir,
+            session_id=self.active_session.session_id,
             summary_client=self.summary_client,
             context_window=config.context_window,
         )
+        extra_read_roots = (
+            [self.memory_manager.user_memory_dir] if self.memory_manager is not None else []
+        )
         self.agent = Agent(
             self.client,
-            Conversation(),
+            self.active_session.conversation,
             self.registry,
             workdir,
             __version__,
-            permission_engine=PermissionEngine(workdir, rule_store),
+            permission_engine=PermissionEngine(
+                workdir,
+                rule_store,
+                sandbox=PathSandbox(workdir, extra_read_roots),
+            ),
             approval_controller=ApprovalController(),
             permission_mode=rule_store.default_mode(),
             context_manager=context_manager,
+            custom_instructions=self.custom_instructions,
+            memory_manager=self.memory_manager,
         )
         self.session_state = SessionState.IDLE
         self._update_permission_mode_display()
@@ -364,6 +470,10 @@ class DragonCodeApp(App):
         """接收输入框提交事件。"""
 
         if self.session_state is not SessionState.IDLE:
+            if event.value.strip() == "/resume":
+                self.query_one("#conversation", RichLog).write(
+                    Text("● 当前任务结束后才能恢复其他会话。", style="bold yellow")
+                )
             return
 
         text = event.value
@@ -391,6 +501,9 @@ class DragonCodeApp(App):
             return
         if command == "/compact":
             self._start_manual_compact()
+            return
+        if command == "/resume":
+            self._show_resume_screen()
             return
 
         self._start_turn(text)
@@ -447,7 +560,7 @@ class DragonCodeApp(App):
                 self._write_tool_result(event.tool_result)
             elif event.type == "permission_request" and event.permission_request is not None:
                 self._show_permission_request(event.permission_request)
-            elif event.type in {"permission_warning", "context_warning"}:
+            elif event.type in {"permission_warning", "context_warning", "session_warning"}:
                 self.query_one("#conversation", RichLog).write(
                     Text(f"● {event.text}", style="bold yellow")
                 )
@@ -501,6 +614,10 @@ class DragonCodeApp(App):
             return
         try:
             async for event in self.agent.compact_context():
+                if event.type == "session_warning":
+                    self.query_one("#conversation", RichLog).write(
+                        Text(f"● {event.text}", style="bold yellow")
+                    )
                 if event.compact is not None:
                     self._write_compact_event(event.compact)
         except asyncio.CancelledError:
@@ -725,6 +842,11 @@ class DragonCodeApp(App):
         ):
             self.screen.submit_highlighted()
             return
+        if self.session_state is SessionState.RESUMING and isinstance(
+            self.screen, SessionResumeScreen
+        ):
+            self.screen.submit_highlighted()
+            return
         if self.session_state is not SessionState.IDLE:
             return
         input_widget = self.query_one("#message-input", MessageInput)
@@ -766,6 +888,8 @@ class DragonCodeApp(App):
             ("执行已确认的计划\n", "dim"),
             ("  /compact        ", "cyan"),
             ("立即压缩当前对话上下文\n", "dim"),
+            ("  /resume         ", "cyan"),
+            ("搜索并恢复本项目历史会话\n", "dim"),
             ("\n快捷键：\n", "bold cyan"),
             ("  Enter           ", "cyan"),
             ("提交消息\n", "dim"),
@@ -805,6 +929,11 @@ class DragonCodeApp(App):
         if self.stream_worker is not None:
             self.stream_worker.cancel()
             self.stream_worker = None
+        if self.resume_worker is not None:
+            self.resume_worker.cancel()
+            self.resume_worker = None
+        if self.active_session is not None:
+            self.active_session.writer.close()
         self.exit()
 
     def action_cancel_turn(self) -> None:
@@ -819,6 +948,12 @@ class DragonCodeApp(App):
             and self.agent is not None
         ):
             self.agent.request_cancel()
+        elif self.session_state is SessionState.RESUMING:
+            if isinstance(self.screen, SessionResumeScreen):
+                self.screen.dismiss(None)
+            elif self.resume_worker is not None:
+                self.resume_worker.cancel()
+                self._finish_resume()
 
     def action_copy_or_quit(self) -> None:
         """有选中文字时复制，否则沿用 Ctrl+C 安全退出。"""
@@ -828,8 +963,125 @@ class DragonCodeApp(App):
             self.copy_to_clipboard(selected_text)
             return
 
-        if self.session_state in {SessionState.STREAMING, SessionState.APPROVING}:
+        if self.session_state in {
+            SessionState.STREAMING,
+            SessionState.APPROVING,
+            SessionState.RESUMING,
+        }:
             self.action_cancel_turn()
             return
 
         self.action_safe_quit()
+
+    def _show_resume_screen(self) -> None:
+        """异步扫描会话，避免目录较大时冻结 Textual。"""
+
+        self._clear_input()
+        self.query_one("#conversation", RichLog).write(Text("❯ /resume", style="bold cyan"))
+        self.session_state = SessionState.RESUMING
+        self.query_one("#message-input", MessageInput).disabled = True
+        self.resume_worker = self.run_worker(
+            self._load_session_list(),
+            name="session-list",
+            exclusive=True,
+            exit_on_error=False,
+        )
+
+    async def _load_session_list(self) -> None:
+        try:
+            sessions = await asyncio.to_thread(self.session_manager.list_sessions)
+        except Exception:
+            self.query_one("#conversation", RichLog).write(
+                Text("● 无法读取历史会话列表。", style="bold yellow")
+            )
+            self._finish_resume()
+            return
+        if not sessions:
+            self.query_one("#conversation", RichLog).write(
+                Text("● 当前项目还没有可恢复的会话。", style="dim")
+            )
+            self._finish_resume()
+            return
+        self.resume_worker = None
+        self.push_screen(SessionResumeScreen(sessions), callback=self._resume_selected)
+
+    def _resume_selected(self, session_id: str | None) -> None:
+        if session_id is None:
+            self._finish_resume()
+            return
+        self.resume_worker = self.run_worker(
+            self._restore_session(session_id),
+            name="session-restore",
+            exclusive=True,
+            exit_on_error=False,
+        )
+
+    async def _restore_session(self, session_id: str) -> None:
+        """准备完整新对象后再切换，失败时保留旧会话。"""
+
+        if self.client is None or self.summary_client is None or self.agent is None:
+            self._finish_resume("当前没有可用的 Provider。")
+            return
+        new_session: ActiveSession | None = None
+        try:
+            new_session = await asyncio.to_thread(
+                self.session_manager.restore,
+                session_id,
+                self.client.model,
+            )
+            context_manager = ContextManager(
+                self.session_manager.project_root,
+                session_id=session_id,
+                summary_client=self.summary_client,
+                context_window=self.client.config.context_window,
+            )
+            system = await build_system_prompt(
+                self.session_manager.project_root,
+                __version__,
+                self.client.model,
+                custom_instructions=self.custom_instructions,
+                memory=self.memory_manager.current_index() if self.memory_manager else "",
+            )
+            history = new_session.conversation.get_messages()
+            if context_manager.restored_history_needs_compaction(
+                history,
+                system,
+                self.registry.definitions(),
+            ):
+                outcome = await context_manager.compact_restored_history(history)
+                if not outcome.success:
+                    raise RuntimeError("恢复历史超过模型窗口，自动压缩失败")
+                new_session.conversation.replace_messages(outcome.history)
+
+            old_session = self.active_session
+            self.agent.replace_session(new_session.conversation, context_manager)
+            self.active_session = new_session
+            if old_session is not None:
+                old_session.writer.close()
+
+            self.session_usage = TokenUsage(0, 0)
+            self._update_usage_status(self.session_usage)
+            notice = f"● 已恢复会话 {session_id}，共 {new_session.restored_count} 条消息。"
+            self.query_one("#conversation", RichLog).write(Text(notice, style="bold green"))
+            for item in new_session.restore_notices:
+                self.query_one("#conversation", RichLog).write(
+                    Text(f"● {item}", style="bold yellow")
+                )
+            self._finish_resume()
+        except asyncio.CancelledError:
+            if new_session is not None:
+                new_session.writer.close()
+            self._finish_resume()
+        except Exception as error:
+            if new_session is not None:
+                new_session.writer.close()
+            self._finish_resume(f"恢复失败：{error}")
+
+    def _finish_resume(self, error: str = "") -> None:
+        self.resume_worker = None
+        self.session_state = SessionState.IDLE
+        input_widget = self.query_one("#message-input", MessageInput)
+        input_widget.disabled = False
+        input_widget.focus()
+        if error:
+            self.query_one("#conversation", RichLog).write(Text(f"● {error}", style="bold red"))

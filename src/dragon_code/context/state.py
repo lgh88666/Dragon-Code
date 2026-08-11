@@ -5,8 +5,8 @@ from __future__ import annotations
 import hashlib
 import re
 import secrets
-import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -16,12 +16,27 @@ if TYPE_CHECKING:
     from dragon_code.models import ChatMessage
 
 _SAFE_PREFIX_RE = re.compile(r"[^A-Za-z0-9_-]+")
+_NEW_SESSION_ID_RE = re.compile(r"\d{8}-\d{6}-[0-9a-f]{4}")
+_LEGACY_SESSION_ID_RE = re.compile(r"\d+-[0-9a-f]{8}")
 
 
 def make_session_id() -> str:
-    """生成适合 Windows 路径且进程内足够唯一的会话 ID。"""
+    """生成适合列表展示、Windows 路径和同秒并发的会话 ID。"""
 
-    return f"{int(time.time())}-{secrets.token_hex(4)}"
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return f"{timestamp}-{secrets.token_hex(2)}"
+
+
+def is_new_session_id(value: str) -> bool:
+    """判断是否为 ch09 新会话 ID。"""
+
+    return _NEW_SESSION_ID_RE.fullmatch(value) is not None
+
+
+def is_safe_session_id(value: str) -> bool:
+    """兼容 ch08 旧 ID，但拒绝任何路径字符。"""
+
+    return is_new_session_id(value) or _LEGACY_SESSION_ID_RE.fullmatch(value) is not None
 
 
 def safe_result_filename(call_id: str) -> str:
@@ -44,8 +59,8 @@ class SessionPaths:
     @classmethod
     def create(cls, working_dir: Path, session_id: str | None = None) -> SessionPaths:
         root = working_dir.resolve()
-        resolved_session_id = session_id or make_session_id()
-        if not re.fullmatch(r"\d+-[0-9a-f]{8}", resolved_session_id):
+        resolved_session_id = make_session_id() if session_id is None else session_id
+        if not is_safe_session_id(resolved_session_id):
             raise ValueError("session_id 格式不安全")
         session_dir = root / ".dragon-code" / "sessions" / resolved_session_id
         return cls(

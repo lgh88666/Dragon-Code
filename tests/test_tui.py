@@ -8,7 +8,7 @@ from rich.markdown import Markdown
 from rich.text import Text
 from textual.color import Color
 from textual.events import MouseMove
-from textual.widgets import OptionList, RichLog, Static
+from textual.widgets import Input, OptionList, RichLog, Static
 
 from dragon_code.clients.base import LLMError
 from dragon_code.models import (
@@ -23,11 +23,14 @@ from dragon_code.models import (
 )
 from dragon_code.permissions import ApprovalChoice, PermissionMode, PermissionRequest
 from dragon_code.prompt import DO_PLAN_PROMPT
+from dragon_code.session import Conversation
+from dragon_code.sessions import SessionManager
 from dragon_code.tools import create_default_registry
 from dragon_code.tui import (
     DragonCodeApp,
     MessageInput,
     PermissionApprovalScreen,
+    SessionResumeScreen,
     SessionState,
     format_tool_call,
     format_tool_result,
@@ -839,3 +842,116 @@ def test_tool_line_and_result_summary_are_short():
     )
     assert "完整结果已保存" in format_tool_result(offloaded)
     assert format_tool_result(failure) == "文件不存在"
+
+
+async def test_resume_screen_filters_and_restores_original_session(tmp_path):
+    source_manager = SessionManager(tmp_path)
+    source = source_manager.open_new("saved-model")
+    source.conversation.commit_messages(
+        [
+            ChatMessage("user", "unique dragon title"),
+            ChatMessage("assistant", "saved answer"),
+        ]
+    )
+    source_id = source.session_id
+    source_manager.close()
+
+    manager = SessionManager(tmp_path)
+    client = FakeClient()
+    config = AppConfig([provider_config(client.name, client.model)])
+    app = DragonCodeApp(
+        config,
+        client_factory=lambda _config: client,
+        session_manager=manager,
+    )
+
+    async with app.run_test(size=(100, 32)) as pilot:
+        input_widget = app.query_one("#message-input", MessageInput)
+        input_widget.load_text("/resume")
+        await pilot.press("enter")
+        for _ in range(30):
+            if isinstance(app.screen, SessionResumeScreen):
+                break
+            await pilot.pause(0.02)
+        assert isinstance(app.screen, SessionResumeScreen)
+
+        search = app.screen.query_one("#resume-search", Input)
+        search.value = "unique dragon"
+        await pilot.pause()
+        assert app.screen.query_one("#resume-options", OptionList).option_count == 1
+
+        await pilot.press("enter")
+        await wait_until_idle(app, pilot, attempts=80)
+
+        assert app.active_session is not None
+        assert app.active_session.session_id == source_id
+        assert app.agent is not None
+        assert [message.content for message in app.agent.conversation.get_messages()] == [
+            "unique dragon title",
+            "saved answer",
+        ]
+
+
+async def test_resume_failure_keeps_old_conversation(tmp_path, monkeypatch):
+    manager = SessionManager(tmp_path)
+    client = FakeClient()
+    app = DragonCodeApp(
+        AppConfig([provider_config()]),
+        client_factory=lambda _config: client,
+        session_manager=manager,
+    )
+
+    async with app.run_test(size=(90, 30)) as pilot:
+        assert app.agent is not None
+        old_conversation = app.agent.conversation
+
+        def fail_restore(_session_id, _model):
+            raise OSError("broken file")
+
+        monkeypatch.setattr(manager, "restore", fail_restore)
+        app.session_state = SessionState.RESUMING
+        app.query_one("#message-input", MessageInput).disabled = True
+
+        await app._restore_session("20260811-120000-abcd")
+        await pilot.pause()
+
+        assert app.session_state is SessionState.IDLE
+        assert app.agent.conversation is old_conversation
+        assert "恢复失败" in "\n".join(line.text for line in app.query_one(RichLog).lines)
+
+
+async def test_resume_during_stream_only_shows_wait_notice():
+    client = FakeClient(chunks=["完成"], delay=0.1)
+    app = app_with_client(client)
+
+    async with app.run_test(size=(90, 30)) as pilot:
+        app.query_one("#message-input", MessageInput).load_text("运行中")
+        await pilot.press("enter")
+        await wait_until_state(app, pilot, SessionState.STREAMING)
+
+        app.on_message_input_submitted(MessageInput.Submitted("/resume"))
+        await wait_until_idle(app, pilot)
+
+        text = "\n".join(line.text for line in app.query_one(RichLog).lines)
+        assert "当前任务结束后才能恢复" in text
+
+
+async def test_session_warning_is_visible_and_next_turn_can_continue(tmp_path):
+    client = FakeClient(chunks=["正常回复"])
+    app = app_with_client(client)
+
+    async with app.run_test(size=(90, 30)) as pilot:
+        assert app.agent is not None
+
+        def fail(_message):
+            raise OSError("disk full")
+
+        app.agent.conversation = Conversation(on_append=fail)
+        app.query_one("#message-input", MessageInput).load_text("第一轮")
+        await pilot.press("enter")
+        await wait_until_idle(app, pilot)
+
+        text = "\n".join(line.text for line in app.query_one(RichLog).lines)
+        assert "本轮未能保存" in text
+        assert "正常回复" in text
+        assert app.query_one("#message-input", MessageInput).disabled is False

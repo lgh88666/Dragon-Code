@@ -48,12 +48,15 @@ class ToolRegistry:
         return await tool.execute(call)
 
 
-def create_default_registry(workdir: Path) -> ToolRegistry:
+def create_default_registry(
+    workdir: Path,
+    extra_read_roots: list[Path] | None = None,
+) -> ToolRegistry:
     """为一次 Dragon Code 会话注册固定的六个工具。"""
 
     registry = ToolRegistry()
     for tool in [
-        ReadTool(workdir),
+        ReadTool(workdir, extra_read_roots),
         WriteTool(workdir),
         EditTool(workdir),
         BashTool(workdir),

@@ -2,7 +2,7 @@
 
 Dragon Code 是一个使用 Python 构建的、Claude Code 风格终端 AI 编程助手。
 
-当前已完成 ch02–ch08 的核心能力：
+当前已完成 ch02–ch09 的核心能力：
 
 - Anthropic 与 OpenAI Chat Completions 两种协议
 - OpenAI 兼容端点
@@ -21,6 +21,9 @@ Dragon Code 是一个使用 Python 构建的、Claude Code 风格终端 AI 编�
 - 工具大结果自动落盘、稳定预览和按路径重读
 - 对话窗口逼近上限时自动生成结构化摘要
 - `/compact` 手动压缩与连续三次自动失败熔断
+- 三层 `DRAGON.md` 项目指令与安全 `@include`
+- JSONL 会话存档、`/resume` 搜索恢复和 45 天清理
+- 项目级与用户级自动记忆索引
 
 当前仍不包含 MCP Resources/Prompts、自动重连、网络访问限制、资源配额和审计日志。
 
@@ -136,6 +139,7 @@ uv run python -m dragon_code
 - `/plan`：进入只读计划模式
 - `/do`：执行已经完成的计划
 - `/compact`：立即压缩当前对话上下文
+- `/resume`：搜索并恢复当前项目的历史会话
 - Shift+Tab：循环切换四种权限模式
 - Esc：取消当前 Agent 任务
 - Ctrl+C：有选中文字时复制；任务中取消；空闲时退出
@@ -150,6 +154,28 @@ Read 支持可选的 `offset`（起始行）和 `limit`（最多行数），可�
 
 普通请求逼近模型窗口时会自动压缩较早历史并保留近期原文。自动摘要连续失败三次后
 进入熔断，但仍会继续主请求；用户可以随时在空闲状态使用 `/compact` 手动重试。
+
+## 项目指令、会话与记忆
+
+Dragon Code 启动时按以下优先级加载手写项目指令：
+
+1. 项目根 `DRAGON.md`
+2. 项目 `.dragon-code/DRAGON.md`
+3. 用户 `~/.dragon-code/DRAGON.md`
+
+高优先级内容排在前面。指令文件可用独占一行的 `@include 相对路径` 引用其他 UTF-8
+Markdown；嵌套最多 5 层，并会拦截循环引用、二进制文件和越过所属根目录的路径。
+手写 `DRAGON.md` 不会被 Git 自动忽略，是否提交由项目维护者决定。
+
+每次启动先创建新会话，完整逻辑消息追加到
+`.dragon-code/sessions/<session_id>/conversation.jsonl`。输入 `/resume` 可按标题或会话 ID
+搜索并恢复；损坏的单行会被跳过，缺少 ToolResult 的末尾 ToolCall 会被安全截断。只有新格式
+会话参与列表和自动清理，超过 45 天的会话会在启动后后台清理。
+
+自动记忆分为用户偏好、纠正反馈、项目知识和参考资料。项目记忆位于
+`.dragon-code/memory/`，用户记忆位于 `~/.dragon-code/memory/`。模型只在自然完成后的每
+5 轮，或用户明确说“记住/别忘/remember/memo”时后台整理；失败不会中断主对话。
+项目会话和自动记忆已被 Git 忽略，用户级目录本身位于仓库外。
 
 ## 权限系统
 
@@ -195,4 +221,4 @@ uv run pytest -q
 ```
 
 最终验收需在 tmux 中启动 Dragon Code，输入真实对话，并逐项核对
-[`specs/ch08-context-management/checklist.md`](specs/ch08-context-management/checklist.md)。
+[`specs/ch09-memory-session/checklist.md`](specs/ch09-memory-session/checklist.md)。

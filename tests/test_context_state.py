@@ -19,6 +19,8 @@ from dragon_code.context.state import (
     ReplacementLedger,
     SessionPaths,
     UsageAnchor,
+    is_new_session_id,
+    is_safe_session_id,
     make_session_id,
     safe_result_filename,
 )
@@ -37,7 +39,20 @@ def test_session_id_is_unique_and_windows_safe():
     values = {make_session_id() for _ in range(20)}
 
     assert len(values) == 20
-    assert all(re.fullmatch(r"\d+-[0-9a-f]{8}", value) for value in values)
+    assert all(re.fullmatch(r"\d{8}-\d{6}-[0-9a-f]{4}", value) for value in values)
+    assert all(is_new_session_id(value) for value in values)
+
+
+def test_legacy_session_id_remains_safe_but_is_not_new():
+    assert is_safe_session_id("1234567890-deadbeef") is True
+    assert is_new_session_id("1234567890-deadbeef") is False
+
+
+@pytest.mark.parametrize("value", ["../bad", "x/y", "x\\y", "", "20260811-bad"])
+def test_unsafe_session_ids_are_rejected(value: str, tmp_path: Path):
+    assert is_safe_session_id(value) is False
+    with pytest.raises(ValueError):
+        SessionPaths.create(tmp_path, value)
 
 
 def test_session_paths_stay_under_working_directory(tmp_path: Path):

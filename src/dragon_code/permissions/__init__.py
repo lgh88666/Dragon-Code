@@ -9,6 +9,7 @@ from dragon_code.permissions.models import (
     PermissionRule,
     RuleLayer,
 )
+from dragon_code.permissions.sandbox import PathSandbox
 
 __all__ = [
     "ApprovalChoice",
@@ -18,4 +19,5 @@ __all__ = [
     "PermissionResult",
     "PermissionRule",
     "RuleLayer",
+    "PathSandbox",
 ]

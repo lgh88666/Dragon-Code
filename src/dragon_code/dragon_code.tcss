@@ -153,3 +153,35 @@ ProviderSelectScreen {
     height: auto;
     max-height: 20;
 }
+
+SessionResumeScreen {
+    align: center middle;
+    background: $background 70%;
+}
+
+#resume-dialog {
+    width: 82%;
+    max-width: 96;
+    height: auto;
+    max-height: 80%;
+    border: round $accent;
+    background: $surface;
+    padding: 1 2;
+}
+
+#resume-title {
+    width: 1fr;
+    height: 2;
+    text-style: bold;
+}
+
+#resume-search {
+    width: 1fr;
+    margin-bottom: 1;
+}
+
+#resume-options {
+    width: 1fr;
+    height: auto;
+    max-height: 20;
+}

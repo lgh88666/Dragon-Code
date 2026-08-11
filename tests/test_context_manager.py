@@ -545,3 +545,44 @@ async def test_cancel_active_summary_propagates_cancellation(tmp_path: Path):
 
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+def test_restored_history_compaction_threshold_uses_existing_estimator(tmp_path: Path):
+    manager = ContextManager(
+        tmp_path,
+        session_id="20260811-120000-abcd",
+        context_window=45_000,
+    )
+
+    assert (
+        manager.restored_history_needs_compaction(
+            [ChatMessage("user", "short")],
+            SystemPrompt("stable", "environment"),
+            [],
+        )
+        is False
+    )
+    assert (
+        manager.restored_history_needs_compaction(
+            [ChatMessage("user", "short")],
+            SystemPrompt("stable", "environment"),
+            [large_tool_definition()],
+        )
+        is True
+    )
+
+
+@pytest.mark.asyncio
+async def test_compact_restored_history_uses_restore_reason_once(tmp_path: Path):
+    client = FakeSummaryClient()
+    manager = ContextManager(
+        tmp_path,
+        session_id="20260811-120000-abcd",
+        summary_client=client,
+    )
+
+    outcome = await manager.compact_restored_history([ChatMessage("user", "历史")])
+
+    assert outcome.success is True
+    assert outcome.stats.reason == "restore"
+    assert len(client.requests) == 1

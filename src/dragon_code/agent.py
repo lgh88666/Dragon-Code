@@ -1,7 +1,11 @@
 """Dragon Code 的 ReAct Agent Loop。"""
 
+from __future__ import annotations
+
 import asyncio
+import copy
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from dragon_code.clients.base import LLMClient, LLMError
 from dragon_code.context.manager import ContextManager
@@ -30,6 +34,9 @@ from dragon_code.stream_collector import StreamCollector
 from dragon_code.tool_scheduler import ToolBatch, ToolScheduler
 from dragon_code.tools.registry import ToolRegistry
 
+if TYPE_CHECKING:
+    from dragon_code.memory import MemoryManager
+
 ITERATION_LIMIT_MESSAGE = "已达到 Agent Loop 的 50 次迭代上限。"
 UNKNOWN_TOOL_LIMIT_MESSAGE = "模型连续请求未知工具，Agent Loop 已停止。"
 
@@ -50,6 +57,8 @@ class Agent:
         approval_controller: ApprovalController | None = None,
         permission_mode: PermissionMode = PermissionMode.DEFAULT,
         context_manager: ContextManager | None = None,
+        custom_instructions: str = "",
+        memory_manager: MemoryManager | None = None,
     ):
         self.client = client
         self.conversation = conversation
@@ -60,6 +69,9 @@ class Agent:
         self.max_iterations = max_iterations
         self.unknown_tool_limit = unknown_tool_limit
         self.context_manager = context_manager or ContextManager(self.working_dir)
+        self.custom_instructions = custom_instructions
+        self.memory_manager = memory_manager
+        self.completed_turns = 0
 
         # 默认空规则只用于向后兼容和测试；TUI 启动时会注入真实三级配置。
         if permission_engine is None:
@@ -124,6 +136,9 @@ class Agent:
         phase = "manual_complete" if outcome.success else "manual_failed"
         if outcome.success:
             self.conversation.replace_messages(outcome.history)
+            warning = self.conversation.take_persistence_warning()
+            if warning:
+                yield AgentEvent(type="session_warning", text=warning)
         yield AgentEvent(
             type="compact",
             compact=CompactEvent(
@@ -146,9 +161,12 @@ class Agent:
             self.working_dir,
             self.version,
             self.client.model,
+            custom_instructions=self.custom_instructions,
+            memory=self.memory_manager.current_index() if self.memory_manager else "",
         )
 
         user_message = ChatMessage(role="user", content=user_text)
+        turn_messages = [copy.deepcopy(user_message)]
         user_committed = False
         unknown_rounds = 0
 
@@ -203,6 +221,9 @@ class Agent:
                 )
                 if prepared.compact.success:
                     self.conversation.replace_messages(prepared.committed_history)
+                    warning = self.conversation.take_persistence_warning()
+                    if warning:
+                        yield AgentEvent(type="session_warning", text=warning)
             if prepared.circuit_tripped:
                 yield AgentEvent(
                     type="compact",
@@ -280,9 +301,21 @@ class Agent:
                     messages_to_commit.append(user_message)
                 messages_to_commit.append(assistant_message)
                 self.conversation.commit_messages(messages_to_commit)
+                turn_messages.append(copy.deepcopy(assistant_message))
+                warning = self.conversation.take_persistence_warning()
+                if warning:
+                    yield AgentEvent(type="session_warning", text=warning)
 
                 if self.mode is PermissionMode.PLAN:
                     self.has_plan = True
+                self.completed_turns += 1
+                if self.memory_manager is not None:
+                    self.memory_manager.schedule_update(
+                        self.client,
+                        turn_messages,
+                        self.completed_turns,
+                        user_text,
+                    )
                 yield AgentEvent(
                     type="completed",
                     text=assistant_message.content,
@@ -320,6 +353,15 @@ class Agent:
                 ]
             )
             self.conversation.commit_messages(messages_to_commit)
+            turn_messages.extend(
+                [
+                    copy.deepcopy(assistant_message),
+                    ChatMessage(role="tool", tool_results=copy.deepcopy(results)),
+                ]
+            )
+            warning = self.conversation.take_persistence_warning()
+            if warning:
+                yield AgentEvent(type="session_warning", text=warning)
 
             if was_cancelled:
                 yield AgentEvent(
@@ -351,6 +393,22 @@ class Agent:
 
         # for 范围本身已经限制迭代数，这里只作为防御性兜底。
         yield AgentEvent(type="limit", text=ITERATION_LIMIT_MESSAGE, usage=self.task_usage)
+
+    def replace_session(
+        self,
+        conversation: Conversation,
+        context_manager: ContextManager,
+    ) -> None:
+        """恢复成功后一次替换会话对象，并清理旧计划状态。"""
+
+        self.conversation = conversation
+        self.context_manager = context_manager
+        self.completed_turns = sum(
+            1 for message in conversation.get_messages() if message.role == "user"
+        )
+        self.mode = PermissionMode.DEFAULT
+        self.has_plan = False
+        self.cancel_requested = False
 
     async def _execute_tools(self, calls: list[ToolCall]):
         """先检查权限，再按原批次执行并保序返回结果。"""

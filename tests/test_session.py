@@ -72,3 +72,38 @@ def test_replace_messages_can_clear_history():
     conversation.replace_messages([])
 
     assert conversation.get_messages() == []
+
+
+def test_initial_messages_do_not_trigger_persistence_callbacks():
+    appended = []
+    conversation = Conversation(
+        initial_messages=[ChatMessage("user", "旧消息")],
+        on_append=appended.append,
+    )
+
+    assert conversation.get_messages() == [ChatMessage("user", "旧消息")]
+    assert appended == []
+
+
+def test_commit_and_replace_trigger_persistence_callbacks():
+    appended = []
+    replaced = []
+    conversation = Conversation(on_append=appended.append, on_replace=replaced.append)
+
+    conversation.commit_messages([ChatMessage("user", "新消息")])
+    conversation.replace_messages([ChatMessage("assistant", "摘要")])
+
+    assert appended == [ChatMessage("user", "新消息")]
+    assert replaced == [[ChatMessage("assistant", "摘要")]]
+
+
+def test_persistence_failure_keeps_memory_and_returns_warning_once():
+    def fail(_message):
+        raise OSError("disk full")
+
+    conversation = Conversation(on_append=fail)
+    conversation.commit_messages([ChatMessage("user", "仍要保留")])
+
+    assert conversation.get_messages() == [ChatMessage("user", "仍要保留")]
+    assert conversation.take_persistence_warning() == "本轮未能保存"
+    assert conversation.take_persistence_warning() == ""

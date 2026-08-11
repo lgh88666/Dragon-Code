@@ -52,11 +52,15 @@ class ReadTool(WorkspaceTool):
     is_concurrency_safe = True
     arguments_model = ReadArguments
 
+    def __init__(self, workdir: Path, extra_read_roots: list[Path] | None = None):
+        super().__init__(workdir)
+        self.extra_read_roots = [root.resolve(strict=False) for root in extra_read_roots or []]
+
     async def run(self, call: ToolCall, arguments: ReadArguments) -> ToolResult:
         return await asyncio.to_thread(self._read, call, arguments)
 
     def _read(self, call: ToolCall, arguments: ReadArguments) -> ToolResult:
-        path = resolve_workspace_path(self.workdir, arguments.path)
+        path = resolve_workspace_path(self.workdir, arguments.path, self.extra_read_roots)
         if not path.exists():
             raise ToolExecutionError("not_found", "文件不存在。")
         if not path.is_file():
@@ -72,11 +76,15 @@ class ReadTool(WorkspaceTool):
         numbered = "\n".join(
             f"{index:>4} | {line}" for index, line in enumerate(selected, arguments.offset)
         )
+        try:
+            display_path = str(path.relative_to(self.workdir))
+        except ValueError:
+            display_path = str(path)
         return self._success(
             call,
             numbered,
             metadata={
-                "path": str(path.relative_to(self.workdir)),
+                "path": display_path,
                 "line_count": len(lines),
                 "offset": arguments.offset,
                 "returned_lines": len(selected),

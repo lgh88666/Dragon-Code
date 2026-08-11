@@ -79,3 +79,18 @@ def test_symlink_escape_is_denied(tmp_path):
 
     result = PathSandbox(root).check(call("Write", path="link/new.txt"))
     assert result.decision is PermissionDecision.DENY
+
+
+def test_extra_root_is_read_only(tmp_path):
+    root = tmp_path / "project"
+    memory = tmp_path / "home" / ".dragon-code" / "memory"
+    root.mkdir()
+    memory.mkdir(parents=True)
+    note = memory / "note.md"
+    note.write_text("memory", encoding="utf-8")
+    sandbox = PathSandbox(root, [memory])
+
+    assert sandbox.check(call("Read", path=str(note))) is None
+    for tool_name in ["Write", "Edit", "Grep"]:
+        result = sandbox.check(call(tool_name, path=str(note), pattern="memory"))
+        assert result.decision is PermissionDecision.DENY

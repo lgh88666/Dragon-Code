@@ -5,8 +5,12 @@ from pathlib import Path
 from dragon_code.tools.base import ToolExecutionError
 
 
-def resolve_workspace_path(workdir: Path, user_path: str) -> Path:
-    """解析路径，并确保真实目标仍位于工作目录内。"""
+def resolve_workspace_path(
+    workdir: Path,
+    user_path: str,
+    extra_roots: list[Path] | None = None,
+) -> Path:
+    """解析路径，并确保真实目标位于工作目录或批准的额外根内。"""
 
     workspace = workdir.resolve()
     candidate = Path(user_path).expanduser()
@@ -14,11 +18,15 @@ def resolve_workspace_path(workdir: Path, user_path: str) -> Path:
         candidate = workspace / candidate
     resolved = candidate.resolve(strict=False)
 
-    try:
-        resolved.relative_to(workspace)
-    except ValueError as error:
-        raise ToolExecutionError("path_outside_workspace", "目标路径超出工作目录。") from error
-    return resolved
+    allowed_roots = [workspace]
+    allowed_roots.extend(root.expanduser().resolve(strict=False) for root in extra_roots or [])
+    for root in allowed_roots:
+        try:
+            resolved.relative_to(root)
+            return resolved
+        except ValueError:
+            continue
+    raise ToolExecutionError("path_outside_workspace", "目标路径超出允许的读取范围。")
 
 
 def validate_glob_pattern(pattern: str) -> None:
