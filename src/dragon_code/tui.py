@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import subprocess
 import time
 from collections.abc import Callable
 from dataclasses import replace
@@ -26,8 +27,28 @@ from dragon_code import __version__
 from dragon_code.agent import Agent
 from dragon_code.clients.base import LLMClient, LLMError
 from dragon_code.clients.factory import create_llm_client
+from dragon_code.command import (
+    Command,
+    CommandStatus,
+    CompletionState,
+    create_command_registry,
+    dispatch_command,
+)
+from dragon_code.command.builtin_prompt import build_review_prompt
+from dragon_code.command_screens import (
+    CommandHelpScreen,
+    ConfirmCommandScreen,
+    MemoryCommandScreen,
+    MemoryScreenResult,
+    PermissionModeScreen,
+    ReviewTargetScreen,
+    SessionCommandScreen,
+    SessionScreenResult,
+)
+from dragon_code.command_widgets import CommandCompletion
 from dragon_code.context.manager import ContextManager
-from dragon_code.memory import MemoryManager
+from dragon_code.context.summary import estimate_message_tokens
+from dragon_code.memory import MemoryInfo, MemoryManager
 from dragon_code.models import (
     AppConfig,
     ProviderConfig,
@@ -89,6 +110,7 @@ class SessionState(Enum):
     STREAMING = "streaming"
     APPROVING = "approving"
     RESUMING = "resuming"
+    COMMAND = "command"
 
 
 class ConversationLog(RichLog):
@@ -133,6 +155,9 @@ class MessageInput(TextArea):
     BINDINGS = [
         Binding("enter", "submit", show=False, priority=True),
         Binding("alt+enter", "insert_newline", show=False, priority=True),
+        Binding("up", "completion_up", show=False, priority=True),
+        Binding("down", "completion_down", show=False, priority=True),
+        Binding("tab", "completion_tab", show=False, priority=True),
     ]
 
     class Submitted(Message):
@@ -145,12 +170,26 @@ class MessageInput(TextArea):
     def action_submit(self) -> None:
         """提交完整输入，不在这里修改应用状态。"""
 
+        if self.app.accept_completion():
+            return
         self.post_message(self.Submitted(self.text))
 
     def action_insert_newline(self) -> None:
         """在当前光标位置插入换行。"""
 
         self.insert("\n")
+
+    def action_completion_up(self) -> None:
+        if not self.app.move_completion(-1):
+            self.action_cursor_up()
+
+    def action_completion_down(self) -> None:
+        if not self.app.move_completion(1):
+            self.action_cursor_down()
+
+    def action_completion_tab(self) -> None:
+        if self.app.completion_state.active:
+            self.app.accept_completion()
 
 
 class ProviderSelectScreen(ModalScreen[int]):
@@ -366,7 +405,10 @@ class DragonCodeApp(App):
             extra_read_roots,
         )
         self.client_factory = client_factory
+        self.command_registry = create_command_registry()
+        self.completion_state = CompletionState()
         self.session_state = SessionState.SELECTING
+        self.active_provider: ProviderConfig | None = None
         self.client: LLMClient | None = None
         self.summary_client: LLMClient | None = None
         self.agent: Agent | None = None
@@ -375,7 +417,9 @@ class DragonCodeApp(App):
         self.timer: Timer | None = None
         self.stream_worker: Worker | None = None
         self.resume_worker: Worker | None = None
+        self.command_worker: Worker | None = None
         self.active_session: ActiveSession | None = None
+        self.session_screen_items: dict[str, SessionInfo] = {}
         self.spinner_index = 0
         self.current_iteration = 0
         self.max_iterations = 0
@@ -390,6 +434,7 @@ class DragonCodeApp(App):
         yield ConversationLog(id="conversation", wrap=True, highlight=False, markup=False)
         yield Static("", id="streaming", markup=False)
         yield Static("", id="timer", markup=False)
+        yield CommandCompletion(id="command-completion")
         with Horizontal(id="input-row"):
             yield Static("❯", id="input-prompt")
             yield MessageInput(
@@ -401,6 +446,7 @@ class DragonCodeApp(App):
         with Horizontal(id="statusbar"):
             yield Static("", id="provider-name")
             yield Static("Token 0", id="token-usage")
+            yield Static("Tab 补全 · /help", id="command-hint")
             yield Static("", id="model-name")
 
     def on_mount(self) -> None:
@@ -429,6 +475,7 @@ class DragonCodeApp(App):
 
     def _activate_provider(self, index: int) -> None:
         config = self.config.providers[index]
+        self.active_provider = config
         self.client = self.client_factory(config)
         summary_config = replace(config, model=config.summary_model or config.model)
         self.summary_client = self.client_factory(summary_config)
@@ -463,52 +510,108 @@ class DragonCodeApp(App):
         )
         self.session_state = SessionState.IDLE
         self._update_permission_mode_display()
+        self._set_command_hint(True)
         self.query_one("#model-name", Static).update(self.client.model)
         self.query_one("#message-input", MessageInput).focus()
 
     def on_message_input_submitted(self, event: MessageInput.Submitted) -> None:
         """接收输入框提交事件。"""
 
+        if self.command_worker is not None:
+            if event.value.strip().startswith("/"):
+                self.show_message("上一条命令处理完成后再执行新命令。", error=True)
+            return
+
         if self.session_state is not SessionState.IDLE:
-            if event.value.strip() == "/resume":
-                self.query_one("#conversation", RichLog).write(
-                    Text("● 当前任务结束后才能恢复其他会话。", style="bold yellow")
-                )
+            if event.value.strip().startswith("/"):
+                self.show_message("当前任务结束或取消后再执行命令。", error=True)
             return
 
         text = event.value
         if not text.strip():
             return
-        if text.strip() == "/exit":
-            self.action_safe_quit()
-            return
-        if text.strip() == "/help":
-            self._show_help()
-            return
-
-        command = text.strip()
-        if command == "/plan":
-            self._enter_plan_mode()
-            return
-        if command.startswith("/plan "):
-            task = command[len("/plan ") :].strip()
-            if task:
-                self._enter_plan_mode(show_notice=False)
-                self._start_turn(task, display_text=text)
-            return
-        if command == "/do":
-            self._execute_plan()
-            return
-        if command == "/compact":
-            self._start_manual_compact()
-            return
-        if command == "/resume":
-            self._show_resume_screen()
+        if text.strip().startswith("/"):
+            self._clear_input()
+            self._hide_completion()
+            self.command_worker = self.run_worker(
+                self._dispatch_slash_command(text),
+                name="slash-command",
+                exclusive=False,
+                exit_on_error=False,
+            )
             return
 
         self._start_turn(text)
 
-    def _start_turn(self, user_text: str, display_text: str | None = None) -> None:
+    async def _dispatch_slash_command(self, text: str) -> None:
+        try:
+            await dispatch_command(text, self.command_registry, self)
+        finally:
+            # Textual 可能立即启动很快结束的 Worker。先让 run_worker 的返回值完成赋值，
+            # 再清空引用，避免已完成的 Worker 被重新写回而永久误判为忙碌。
+            await asyncio.sleep(0)
+            self.command_worker = None
+
+    def on_text_area_changed(self, event: TextArea.Changed) -> None:
+        """输入变化时刷新命令候选。"""
+
+        if not isinstance(event.text_area, MessageInput):
+            return
+        text = event.text_area.text
+        if self.completion_state.suppresses(text):
+            self._hide_completion()
+            return
+        if (
+            self.session_state is not SessionState.IDLE
+            or "\n" in text
+            or not text.startswith("/")
+            or any(character.isspace() for character in text)
+        ):
+            self._hide_completion()
+            return
+        self.completion_state.update(self.command_registry.complete(text))
+        self.query_one("#command-completion", CommandCompletion).show_state(self.completion_state)
+
+    def move_completion(self, direction: int) -> bool:
+        if not self.completion_state.active:
+            return False
+        if direction < 0:
+            self.completion_state.move_up()
+        else:
+            self.completion_state.move_down()
+        self.query_one("#command-completion", CommandCompletion).show_state(self.completion_state)
+        return True
+
+    def accept_completion(self) -> bool:
+        """只填入选中命令；下一次 Enter 才真正提交。"""
+
+        if not self.completion_state.active:
+            return False
+        selected = self.completion_state.selected()
+        if selected is None:
+            self._hide_completion()
+            return False
+        value = f"/{selected.name}"
+        self.completion_state.accept(value)
+        self.query_one("#command-completion", CommandCompletion).hide_menu()
+        self.query_one("#message-input", MessageInput).load_text(value)
+        return True
+
+    def _hide_completion(self) -> None:
+        self.completion_state.hide()
+        try:
+            self.query_one("#command-completion", CommandCompletion).hide_menu()
+        except Exception:
+            # compose 前的测试调用没有挂载 Widget。
+            return
+
+    def _start_turn(
+        self,
+        user_text: str,
+        display_text: str | None = None,
+        *,
+        read_only: bool = False,
+    ) -> None:
         """更新界面状态并启动异步模型请求。"""
 
         conversation = self.query_one("#conversation", RichLog)
@@ -518,6 +621,8 @@ class DragonCodeApp(App):
         input_widget = self.query_one("#message-input", MessageInput)
         input_widget.load_text("")
         input_widget.disabled = True
+        self._hide_completion()
+        self._set_command_hint(False)
 
         self.reply_buffer = ""
         self.turn_start = time.monotonic()
@@ -531,20 +636,20 @@ class DragonCodeApp(App):
         self._update_timer()
         self.timer = self.set_interval(0.1, self._update_timer)
         self.stream_worker = self.run_worker(
-            self._consume_turn(user_text),
+            self._consume_turn(user_text, read_only=read_only),
             name="llm-stream",
             exclusive=True,
             exit_on_error=False,
         )
 
-    async def _consume_turn(self, user_text: str) -> None:
+    async def _consume_turn(self, user_text: str, *, read_only: bool = False) -> None:
         """消费 Agent 事件并实时更新界面。"""
 
         if self.agent is None:
             self._finish_with_error(LLMError("unknown", "当前没有可用的 Provider。"))
             return
 
-        async for event in self.agent.run(user_text):
+        async for event in self.agent.run(user_text, read_only=read_only):
             if event.type == "progress":
                 self.current_iteration = event.iteration
                 self.max_iterations = event.max_iterations
@@ -592,6 +697,8 @@ class DragonCodeApp(App):
         input_widget = self.query_one("#message-input", MessageInput)
         input_widget.load_text("")
         input_widget.disabled = True
+        self._hide_completion()
+        self._set_command_hint(False)
         self.turn_start = time.monotonic()
         self.spinner_index = 0
         self.current_iteration = 0
@@ -700,6 +807,7 @@ class DragonCodeApp(App):
         input_widget = self.query_one("#message-input", MessageInput)
         input_widget.disabled = False
         input_widget.focus()
+        self._set_command_hint(True)
         # 权限 Modal 可能也在本轮刷新中关闭；下一次刷新后再聚焦，避免焦点被弹窗覆盖。
         self.call_after_refresh(input_widget.focus)
         return elapsed
@@ -832,6 +940,8 @@ class DragonCodeApp(App):
     def action_submit_current_input(self) -> None:
         """按会话状态处理 Enter，不依赖焦点是否从 Modal 正确返回。"""
 
+        if self.completion_state.active and self.accept_completion():
+            return
         if self.session_state is SessionState.SELECTING and isinstance(
             self.screen, ProviderSelectScreen
         ):
@@ -847,6 +957,17 @@ class DragonCodeApp(App):
         ):
             self.screen.submit_highlighted()
             return
+        command_screens = (
+            CommandHelpScreen,
+            SessionCommandScreen,
+            MemoryCommandScreen,
+            PermissionModeScreen,
+            ReviewTargetScreen,
+            ConfirmCommandScreen,
+        )
+        if isinstance(self.screen, command_screens):
+            self.screen.submit_highlighted()
+            return
         if self.session_state is not SessionState.IDLE:
             return
         input_widget = self.query_one("#message-input", MessageInput)
@@ -858,7 +979,8 @@ class DragonCodeApp(App):
         if self.agent is None:
             return
         mode = self.agent.mode
-        self.query_one("#provider-name", Static).update(mode.value)
+        provider = self.active_provider.name if self.active_provider is not None else ""
+        self.query_one("#provider-name", Static).update(f"{provider} · {mode.value}")
         messages = {
             PermissionMode.DEFAULT: "● Default：写文件和命令需要确认",
             PermissionMode.ACCEPT_EDITS: "● Accept Edits：文件修改自动允许",
@@ -870,53 +992,174 @@ class DragonCodeApp(App):
     def _clear_input(self) -> None:
         self.query_one("#message-input", MessageInput).load_text("")
 
-    def _show_help(self) -> None:
-        """在对话区显示命令和快捷键帮助，清空输入框。"""
-        self._clear_input()
-        help_text = Text.assemble(
-            ("Dragon Code 帮助\n", "bold white"),
-            ("\n命令：\n", "bold cyan"),
-            ("  /help           ", "cyan"),
-            ("显示本帮助\n", "dim"),
-            ("  /exit           ", "cyan"),
-            ("退出程序\n", "dim"),
-            ("  /plan           ", "cyan"),
-            ("进入只读 Plan Mode\n", "dim"),
-            ("  /plan <任务>    ", "cyan"),
-            ("Plan Mode 中规划任务\n", "dim"),
-            ("  /do             ", "cyan"),
-            ("执行已确认的计划\n", "dim"),
-            ("  /compact        ", "cyan"),
-            ("立即压缩当前对话上下文\n", "dim"),
-            ("  /resume         ", "cyan"),
-            ("搜索并恢复本项目历史会话\n", "dim"),
-            ("\n快捷键：\n", "bold cyan"),
-            ("  Enter           ", "cyan"),
-            ("提交消息\n", "dim"),
-            ("  Alt+Enter       ", "cyan"),
-            ("输入框中换行\n", "dim"),
-            ("  Ctrl+C          ", "cyan"),
-            ("复制选中文字 / 取消当前任务 / 空闲时退出\n", "dim"),
-            ("  Esc             ", "cyan"),
-            ("取消正在运行的 Agent 任务\n", "dim"),
-            ("  Shift+Tab       ", "cyan"),
-            ("切换 default / acceptEdits / plan / bypassPermissions\n", "dim"),
-            ("\n权限确认：\n", "bold cyan"),
-            ("  1               ", "cyan"),
-            ("允许本次\n", "dim"),
-            ("  2               ", "cyan"),
-            ("MCP：本会话允许；内置工具：永久允许\n", "dim"),
-            ("  3               ", "cyan"),
-            ("MCP：永久允许；内置工具：拒绝本次\n", "dim"),
-            ("  4               ", "cyan"),
-            ("MCP 工具拒绝本次\n", "dim"),
-            ("\n工具（Default Mode）：\n", "bold cyan"),
-            ("  Read Write Edit Bash Glob Grep\n", "dim"),
-            ("\n工具（Plan Mode）：\n", "bold cyan"),
-            ("  Read Glob Grep\n", "dim"),
-            ("\n更多：README.md · specs/\n", "dim"),
+    # 下列方法组成 CommandUI：命令层只调用这些高层能力。
+    def is_idle(self) -> bool:
+        return self.session_state is SessionState.IDLE
+
+    def show_message(self, text: str, *, error: bool = False) -> None:
+        style = "bold red" if error else "cyan"
+        self.query_one("#conversation", RichLog).write(Text(f"● {text}", style=style))
+
+    def open_help(self, commands: list[Command]) -> None:
+        self.query_one("#conversation", RichLog).write(Text("❯ /help", style="bold cyan"))
+        self.push_screen(CommandHelpScreen(commands))
+
+    def get_status(self) -> CommandStatus:
+        messages = self.agent.conversation.get_messages() if self.agent is not None else []
+        estimated = sum(estimate_message_tokens(message) for message in messages)
+        builtin_count, mcp_count = self.registry.counts()
+        user_memories = 0
+        project_memories = 0
+        if self.memory_manager is not None:
+            try:
+                user_memories, project_memories = self.memory_manager.memory_counts()
+            except OSError:
+                pass
+        provider = self.active_provider.name if self.active_provider is not None else "未知"
+        model = self.client.model if self.client is not None else "未知"
+        mode = self.agent.mode.value if self.agent is not None else "未知"
+        session_id = self.active_session.session_id if self.active_session is not None else "未知"
+        return CommandStatus(
+            version=__version__,
+            cwd=str(self.session_manager.project_root),
+            provider=provider,
+            model=model,
+            permission_mode=mode,
+            session_id=session_id,
+            input_tokens=self.session_usage.input_tokens,
+            output_tokens=self.session_usage.output_tokens,
+            cache_write_tokens=self.session_usage.cache_write_tokens,
+            cache_read_tokens=self.session_usage.cache_read_tokens,
+            estimated_context_tokens=estimated,
+            builtin_tool_count=builtin_count,
+            mcp_tool_count=mcp_count,
+            user_memory_count=user_memories,
+            project_memory_count=project_memories,
         )
-        self.query_one("#conversation", RichLog).write(help_text)
+
+    def quit(self) -> None:
+        self.action_safe_quit()
+
+    def force_compact(self) -> None:
+        self._start_manual_compact()
+
+    def clear_session(self) -> None:
+        self._begin_local_command("/clear")
+        self.resume_worker = self.run_worker(
+            self._clear_current_session(),
+            name="clear-session",
+            exclusive=True,
+            exit_on_error=False,
+        )
+
+    def enter_plan_mode(self) -> None:
+        self._enter_plan_mode()
+
+    def execute_plan(self) -> None:
+        self._execute_plan()
+
+    def open_sessions(self, *, resume_only: bool = False) -> None:
+        if resume_only:
+            self._show_resume_screen()
+        else:
+            self._show_session_manager()
+
+    def open_memories(self) -> None:
+        if self.memory_manager is None:
+            self.show_message("当前没有可用的记忆管理器。", error=True)
+            return
+        self._begin_local_command("/memory")
+        self.resume_worker = self.run_worker(
+            self._load_memory_screen(),
+            name="memory-list",
+            exclusive=True,
+            exit_on_error=False,
+        )
+
+    def open_permissions(self) -> None:
+        if self.agent is None:
+            self.show_message("当前没有可用的 Agent。", error=True)
+            return
+        self._begin_local_command("/permission")
+        self.push_screen(
+            PermissionModeScreen(self.agent.mode),
+            callback=self._permission_mode_selected,
+        )
+
+    def open_review(self) -> None:
+        self._begin_local_command("/review")
+        self.push_screen(ReviewTargetScreen(), callback=self._review_target_selected)
+
+    def _set_command_hint(self, visible: bool) -> None:
+        try:
+            self.query_one("#command-hint", Static).display = visible
+        except Exception:
+            return
+
+    def _begin_local_command(self, label: str) -> None:
+        self.query_one("#conversation", RichLog).write(Text(f"❯ {label}", style="bold cyan"))
+        self.session_state = SessionState.COMMAND
+        input_widget = self.query_one("#message-input", MessageInput)
+        input_widget.load_text("")
+        input_widget.disabled = True
+        self._hide_completion()
+        self._set_command_hint(False)
+
+    def _finish_local_command(self, error: str = "") -> None:
+        self.resume_worker = None
+        self.session_state = SessionState.IDLE
+        input_widget = self.query_one("#message-input", MessageInput)
+        input_widget.disabled = False
+        input_widget.focus()
+        self._set_command_hint(True)
+        if error:
+            self.show_message(error, error=True)
+
+    async def _clear_current_session(self) -> None:
+        if self.agent is None or self.client is None or self.summary_client is None:
+            self._finish_local_command("当前没有可用的 Provider。")
+            return
+        new_session: ActiveSession | None = None
+        try:
+            new_session = await asyncio.to_thread(
+                self.session_manager.open_new,
+                self.client.model,
+            )
+            context_manager = ContextManager(
+                self.session_manager.project_root,
+                session_id=new_session.session_id,
+                summary_client=self.summary_client,
+                context_window=self.client.config.context_window,
+            )
+            old_session = self.active_session
+            self.agent.replace_session(
+                new_session.conversation,
+                context_manager,
+                preserve_mode=True,
+            )
+            self.active_session = new_session
+            self.session_usage = TokenUsage(0, 0)
+            self.task_usage = TokenUsage(0, 0)
+            self._update_usage_status(self.session_usage)
+            self.query_one("#conversation", RichLog).clear()
+            self.show_message(f"已开始新会话 {new_session.session_id}。")
+            if old_session is not None:
+                old_session.writer.close()
+            self._update_permission_mode_display()
+            self._finish_local_command()
+        except asyncio.CancelledError:
+            if new_session is not None:
+                new_session.writer.close()
+            self._finish_local_command("新建会话已取消。")
+        except Exception as error:
+            if new_session is not None:
+                new_session.writer.close()
+            self._finish_local_command(f"新建会话失败：{error}")
+
+    def _show_help(self) -> None:
+        """兼容旧测试入口，帮助内容仍由注册中心提供。"""
+
+        self.open_help(self.command_registry.visible())
 
     def action_safe_quit(self) -> None:
         """清理计时器和 Worker 后退出。"""
@@ -932,6 +1175,9 @@ class DragonCodeApp(App):
         if self.resume_worker is not None:
             self.resume_worker.cancel()
             self.resume_worker = None
+        if self.command_worker is not None:
+            self.command_worker.cancel()
+            self.command_worker = None
         if self.active_session is not None:
             self.active_session.writer.close()
         self.exit()
@@ -939,6 +1185,22 @@ class DragonCodeApp(App):
     def action_cancel_turn(self) -> None:
         """Esc 只取消正在运行的 Agent，不退出应用。"""
 
+        if self.completion_state.active:
+            self._hide_completion()
+            return
+        if isinstance(
+            self.screen,
+            (
+                CommandHelpScreen,
+                SessionCommandScreen,
+                MemoryCommandScreen,
+                PermissionModeScreen,
+                ReviewTargetScreen,
+                ConfirmCommandScreen,
+            ),
+        ):
+            self.screen.action_cancel()
+            return
         if (
             self.session_state
             in {
@@ -954,6 +1216,10 @@ class DragonCodeApp(App):
             elif self.resume_worker is not None:
                 self.resume_worker.cancel()
                 self._finish_resume()
+        elif self.session_state is SessionState.COMMAND:
+            if self.resume_worker is not None:
+                self.resume_worker.cancel()
+            self._finish_local_command()
 
     def action_copy_or_quit(self) -> None:
         """有选中文字时复制，否则沿用 Ctrl+C 安全退出。"""
@@ -967,6 +1233,7 @@ class DragonCodeApp(App):
             SessionState.STREAMING,
             SessionState.APPROVING,
             SessionState.RESUMING,
+            SessionState.COMMAND,
         }:
             self.action_cancel_turn()
             return
@@ -980,6 +1247,8 @@ class DragonCodeApp(App):
         self.query_one("#conversation", RichLog).write(Text("❯ /resume", style="bold cyan"))
         self.session_state = SessionState.RESUMING
         self.query_one("#message-input", MessageInput).disabled = True
+        self._hide_completion()
+        self._set_command_hint(False)
         self.resume_worker = self.run_worker(
             self._load_session_list(),
             name="session-list",
@@ -1061,6 +1330,7 @@ class DragonCodeApp(App):
 
             self.session_usage = TokenUsage(0, 0)
             self._update_usage_status(self.session_usage)
+            self._update_permission_mode_display()
             notice = f"● 已恢复会话 {session_id}，共 {new_session.restored_count} 条消息。"
             self.query_one("#conversation", RichLog).write(Text(notice, style="bold green"))
             for item in new_session.restore_notices:
@@ -1083,5 +1353,203 @@ class DragonCodeApp(App):
         input_widget = self.query_one("#message-input", MessageInput)
         input_widget.disabled = False
         input_widget.focus()
+        self._set_command_hint(True)
         if error:
             self.query_one("#conversation", RichLog).write(Text(f"● {error}", style="bold red"))
+
+    def _show_session_manager(self) -> None:
+        """扫描并打开会话管理界面。"""
+
+        self.query_one("#conversation", RichLog).write(Text("❯ /session", style="bold cyan"))
+        self.session_state = SessionState.RESUMING
+        self.query_one("#message-input", MessageInput).disabled = True
+        self._hide_completion()
+        self._set_command_hint(False)
+        self.resume_worker = self.run_worker(
+            self._load_session_manager(),
+            name="session-manager-list",
+            exclusive=True,
+            exit_on_error=False,
+        )
+
+    async def _load_session_manager(self) -> None:
+        try:
+            sessions = await asyncio.to_thread(self.session_manager.list_sessions)
+        except Exception:
+            self._finish_resume("无法读取历史会话列表。")
+            return
+        if not sessions:
+            self._finish_resume("当前项目还没有历史会话。")
+            return
+        self.session_screen_items = {item.session_id: item for item in sessions}
+        self.resume_worker = None
+        active_id = self.active_session.session_id if self.active_session is not None else ""
+        self.push_screen(
+            SessionCommandScreen(sessions, active_id, resume_only=False),
+            callback=self._session_command_selected,
+        )
+
+    def _session_command_selected(self, result: SessionScreenResult | None) -> None:
+        if result is None:
+            self._finish_resume()
+            return
+        if result.action == "resume":
+            self._resume_selected(result.session_id)
+            return
+        info = self.session_screen_items.get(result.session_id)
+        if info is None:
+            self._finish_resume("目标会话已经不存在。")
+            return
+        if self.active_session is not None and result.session_id == self.active_session.session_id:
+            self._finish_resume("不能删除当前会话。")
+            return
+        target = f"标题：{info.title}\n会话 ID：{info.session_id}"
+        self.push_screen(
+            ConfirmCommandScreen("永久删除这个会话？", target),
+            callback=lambda confirmed: self._session_delete_confirmed(
+                result.session_id,
+                confirmed,
+            ),
+        )
+
+    def _session_delete_confirmed(self, session_id: str, confirmed: bool) -> None:
+        if not confirmed:
+            self._finish_resume()
+            return
+        self.resume_worker = self.run_worker(
+            self._delete_session(session_id),
+            name="session-delete",
+            exclusive=True,
+            exit_on_error=False,
+        )
+
+    async def _delete_session(self, session_id: str) -> None:
+        active_id = self.active_session.session_id if self.active_session is not None else ""
+        try:
+            await asyncio.to_thread(self.session_manager.delete, session_id, active_id)
+            self.show_message(f"已删除会话 {session_id}。")
+            await self._load_session_manager()
+        except asyncio.CancelledError:
+            self._finish_resume("删除会话已取消。")
+        except Exception as error:
+            self._finish_resume(f"删除会话失败：{error}")
+
+    async def _load_memory_screen(self) -> None:
+        if self.memory_manager is None:
+            self._finish_local_command("当前没有可用的记忆管理器。")
+            return
+        try:
+            memories = await asyncio.to_thread(self.memory_manager.list_memories)
+        except Exception:
+            self._finish_local_command("无法读取长期记忆。")
+            return
+        self.resume_worker = None
+        self.push_screen(MemoryCommandScreen(memories), callback=self._memory_selected)
+
+    def _memory_selected(self, result: MemoryScreenResult | None) -> None:
+        if result is None:
+            self._finish_local_command()
+            return
+        item = result.memory
+        if result.action == "view":
+            text = (
+                f"记忆：{item.title}\n层级：{item.level}\n类型：{item.memory_type}\n"
+                f"文件：{item.filename}\n\n{item.content}"
+            )
+            self.show_message(text)
+            self._finish_local_command()
+            return
+        target = f"层级：{item.level}\n标题：{item.title}\n文件：{item.filename}"
+        self.push_screen(
+            ConfirmCommandScreen("永久删除这条记忆？", target),
+            callback=lambda confirmed: self._memory_delete_confirmed(item, confirmed),
+        )
+
+    def _memory_delete_confirmed(self, item: MemoryInfo, confirmed: bool) -> None:
+        if not confirmed:
+            self._finish_local_command()
+            return
+        self.resume_worker = self.run_worker(
+            self._delete_memory(item),
+            name="memory-delete",
+            exclusive=True,
+            exit_on_error=False,
+        )
+
+    async def _delete_memory(self, item: MemoryInfo) -> None:
+        if self.memory_manager is None:
+            self._finish_local_command("当前没有可用的记忆管理器。")
+            return
+        try:
+            await self.memory_manager.delete_memory(item.level, item.filename)
+            self.show_message(f"已删除记忆“{item.title}”。")
+            await self._load_memory_screen()
+        except asyncio.CancelledError:
+            self._finish_local_command("删除记忆已取消。")
+        except Exception as error:
+            self._finish_local_command(f"删除记忆失败：{error}")
+
+    def _permission_mode_selected(self, mode: PermissionMode | None) -> None:
+        if mode is not None and self.agent is not None:
+            self.agent.set_permission_mode(mode)
+            self._update_permission_mode_display()
+            self.show_message(f"权限模式已切换为 {mode.value}。")
+        self._finish_local_command()
+
+    def _review_target_selected(self, target: str | None) -> None:
+        if target is None:
+            self._finish_local_command()
+            return
+        self.resume_worker = self.run_worker(
+            self._prepare_review(target),
+            name="review-prepare",
+            exclusive=True,
+            exit_on_error=False,
+        )
+
+    async def _prepare_review(self, target: str) -> None:
+        try:
+            prompt_target = target
+            if target == "当前 Git 未提交改动":
+                paths = await asyncio.to_thread(self._git_changed_paths)
+                if not paths:
+                    raise ValueError("当前没有 Git 未提交改动")
+                prompt_target = "当前 Git 未提交文件：" + "、".join(paths)
+            else:
+                root = self.session_manager.project_root
+                candidate = Path(target)
+                if not candidate.is_absolute():
+                    candidate = root / candidate
+                resolved = candidate.resolve(strict=True)
+                resolved.relative_to(root)
+                prompt_target = str(resolved.relative_to(root)) or "."
+
+            prompt = build_review_prompt(prompt_target)
+            self._finish_local_command()
+            self._start_turn(prompt, display_text="/review", read_only=True)
+        except asyncio.CancelledError:
+            self._finish_local_command("代码审查已取消。")
+        except Exception as error:
+            self._finish_local_command(f"无法开始代码审查：{error}")
+
+    def _git_changed_paths(self) -> list[str]:
+        """用参数列表调用 Git，不经过 shell，也不读取配置正文。"""
+
+        completed = subprocess.run(
+            ["git", "status", "--short"],
+            cwd=self.session_manager.project_root,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise ValueError("无法读取 Git 状态")
+        paths = []
+        for line in completed.stdout.splitlines():
+            path = line[3:].strip()
+            if " -> " in path:
+                path = path.split(" -> ", 1)[1]
+            if path:
+                paths.append(path)
+        return paths

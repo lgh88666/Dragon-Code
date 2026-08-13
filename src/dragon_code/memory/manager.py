@@ -17,6 +17,7 @@ from dragon_code.memory.models import (
     VALID_ACTIONS,
     VALID_LEVELS,
     VALID_MEMORY_TYPES,
+    MemoryInfo,
     MemoryOperation,
 )
 from dragon_code.memory.prompt import build_memory_request
@@ -66,6 +67,53 @@ class MemoryManager:
         """返回不可变字符串快照。"""
 
         return self._current_index
+
+    def list_memories(self) -> list[MemoryInfo]:
+        """列出两级有效记忆；损坏文件按不可用跳过。"""
+
+        memories: list[MemoryInfo] = []
+        for level, directory in (
+            ("project", self.project_memory_dir),
+            ("user", self.user_memory_dir),
+        ):
+            if not directory.exists():
+                continue
+            for path in directory.glob("*.md"):
+                if path.name == "MEMORY.md" or not _is_safe_filename(path.name):
+                    continue
+                note = _read_note(path)
+                if note is None:
+                    continue
+                memory_type, title, _created, _updated, content = note
+                memories.append(MemoryInfo(level, path.name, memory_type, title, content))
+        memories.sort(key=lambda item: (item.level, item.title, item.filename))
+        return memories
+
+    def memory_counts(self) -> tuple[int, int]:
+        """返回用户级、项目级记忆数量。"""
+
+        memories = self.list_memories()
+        user_count = sum(1 for item in memories if item.level == "user")
+        return user_count, len(memories) - user_count
+
+    def read_memory(self, level: str, filename: str) -> MemoryInfo:
+        """读取一条通过层级和安全文件名定位的记忆。"""
+
+        directory = self._directory_for_level(level)
+        if not _is_safe_filename(filename):
+            raise ValueError("记忆文件名不安全")
+        note = _read_note(directory / filename)
+        if note is None:
+            raise FileNotFoundError("记忆不存在或格式无效")
+        memory_type, title, _created, _updated, content = note
+        return MemoryInfo(level, filename, memory_type, title, content)
+
+    async def delete_memory(self, level: str, filename: str) -> None:
+        """和自动记忆共用锁，删除后刷新索引快照。"""
+
+        async with self._lock:
+            await asyncio.to_thread(self._delete_memory, level, filename)
+            self.load_indexes()
 
     def should_update(self, completed_turns: int, user_text: str) -> bool:
         """每五个自然完成回合或出现明确记忆关键词时触发。"""
@@ -263,6 +311,16 @@ class MemoryManager:
         index = _limit_index_lines(lines)
         _atomic_write(directory / "MEMORY.md", index)
 
+    def _delete_memory(self, level: str, filename: str) -> None:
+        directory = self._directory_for_level(level)
+        if not _is_safe_filename(filename):
+            raise ValueError("记忆文件名不安全")
+        path = directory / filename
+        if not path.is_file():
+            raise FileNotFoundError("记忆不存在")
+        path.unlink()
+        self._rebuild_index(directory)
+
     def _read_index(self, path: Path) -> str:
         try:
             text = path.read_text(encoding="utf-8")
@@ -271,7 +329,11 @@ class MemoryManager:
         return _limit_index_lines(text.splitlines())
 
     def _directory_for_level(self, level: str) -> Path:
-        return self.project_memory_dir if level == "project" else self.user_memory_dir
+        if level == "project":
+            return self.project_memory_dir
+        if level == "user":
+            return self.user_memory_dir
+        raise ValueError("记忆层级只能是 project 或 user")
 
 
 def _safe_slug(value: str) -> str:

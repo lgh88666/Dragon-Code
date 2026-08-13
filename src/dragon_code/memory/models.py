@@ -23,3 +23,14 @@ class MemoryOperation:
     slug: str = ""
     filename: str = ""
     content: str = ""
+
+
+@dataclass
+class MemoryInfo:
+    """记忆管理界面使用的一条只读记录。"""
+
+    level: str
+    filename: str
+    memory_type: str
+    title: str
+    content: str

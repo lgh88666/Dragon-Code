@@ -15,8 +15,8 @@
 
 ## 当前状态
 
-- 已完成：ch02–ch09。
-- 最近完成模块：ch09 项目记忆与会话持久化。
+- 已完成：ch02–ch10。
+- 最近完成模块：ch10 Slash Command 内置命令框架。
 - ch07 实现提交：`9b0d901 feat: add MCP client integration`。
 - ch08 实现提交：`97d3cd7 feat: add ch08 context management`。
 - ch02–ch08 功能代码已经推送到 GitHub；ch09 已完成本地验收，等待用户明确要求后再推送。
@@ -88,6 +88,15 @@
 - 用户偏好、纠正反馈、项目知识、参考资料四类自动记忆，项目级和用户级分离。
 - `MEMORY.md` 索引注入模型上下文；后台使用当前 LLMClient 更新，不阻塞主对话。
 
+### ch10：Slash Command 内置命令框架
+
+- 12 条内置命令集中注册，统一名称、别名、描述、用法、类型和异步 Handler。
+- 普通消息与 `/` 命令在输入入口分流；命令层通过 `CommandUI` 与 Textual 解耦。
+- 实时主名称补全、上下选择、最多 8 行、第一次 Enter 填入、第二次执行。
+- `/session`、`/memory`、`/permission` 使用交互界面；删除动作有明确确认和安全边界。
+- `/review` 使用一次性只读工具集合，不改变长期模式，也不允许 Write/Edit/Bash。
+- 教材共同能力保持一致；Dragon Code 额外采用统一空闲保护和交互式管理界面。
+
 ## 当前核心调用链
 
 ```text
@@ -96,6 +105,8 @@ CLI 加载 Provider、权限和 MCP 配置
 McpManager 连接 Server、发现工具并注册到 ToolRegistry
   ↓
 Textual TUI 接收用户输入
+  ↓
+Slash Command 分流器：命令交给 CommandRegistry，普通消息继续进入 Agent
   ↓
 Agent 构造 LLMRequest（系统提示、环境、历史、工具定义）
   ↓
@@ -124,6 +135,9 @@ TUI 通过 AgentEvent 实时展示文本、工具行、结果和状态
 |---|---|
 | `src/dragon_code/cli.py` | 加载配置，装配 Registry、MCP Manager 和 TUI，统一清理 |
 | `src/dragon_code/tui.py` | 终端布局、输入、事件消费、权限弹窗和状态展示 |
+| `src/dragon_code/command/` | 命令模型、Registry、分发、补全和三类内置 Handler |
+| `src/dragon_code/command_screens.py` | 帮助、会话、记忆、权限、审查和确认交互界面 |
+| `src/dragon_code/command_widgets.py` | Slash Command 实时候选菜单 |
 | `src/dragon_code/agent.py` | Agent Loop、模式、权限等待、工具执行和事件输出 |
 | `src/dragon_code/models.py` | 消息、请求、事件、工具调用和用量等统一模型 |
 | `src/dragon_code/clients/base.py` | 协议无关 LLMClient 接口 |
@@ -147,6 +161,19 @@ TUI 通过 AgentEvent 实时展示文本、工具行、结果和状态
 | `src/dragon_code/memory/manager.py` | 自动记忆调度、模型更新、原子文件写入和索引重建 |
 
 ## 最近验证状态
+
+ch10 完成时的证据：
+
+- `uv sync --locked`：57 个包检查通过。
+- `uv run ruff format --check .`：160 个文件已格式化。
+- `uv run ruff check .` 与 `compileall`：通过。
+- `uv run pytest -q`：`408 passed, 2 skipped`。
+- tmux + 真实 DeepSeek：补全、帮助、状态、权限弹窗、真实工具调用、只读审查、Esc 取消和 `/q` 退出通过。
+- `/review` 45 秒执行到第 15 轮，仅观察到只读工具，工作树未变化；取消后回到空闲。
+- `/q` 后 `DRAGON_PYTHON_PROCESS_COUNT=0`。
+- 真实数据上的清空恢复、会话删除和记忆删除未执行；对应临时目录集成测试通过。
+
+完整证据见 `specs/ch10-slash-command/acceptance-report.md`。
 
 ch09 完成时的证据：
 
@@ -196,6 +223,7 @@ ch07 完成时的证据：
 
 ## 学习与回顾状态
 
+- ch10 已补充一份聚焦 Registry、分流、UI Protocol、补全和只读审查的学习笔记；下一步可进行核心源码回顾。
 - `docs/learning-notes.md` 已系统整理 ch02、ch03、聊天历史复制、ch05，并补充 ch09 核心源码回顾入口。
 - ch06 已进行过对话式核心回顾，但尚未整理成独立的完整学习笔记章节。
 - ch07、ch08 功能已经开发和验收，完整源码学习笔记仍可按需补充。
@@ -273,10 +301,10 @@ uv run python -m dragon_code
 
 推荐顺序：
 
-1. 回顾 ch09 核心源码：指令加载 → JSONL 会话 → `/resume` → 自动记忆。
-2. 只精读 `instructions/loader.py`、`sessions/manager.py`、`memory/manager.py` 与它们在 `cli.py`/`agent.py`/`tui.py` 的接线。
-3. 学习下一章理论内容。
-4. 按 `AGENTS.md` 的四文档流程启动下一章开发。
+1. 回顾 ch10 核心源码：输入分流 → Registry → Handler → CommandUI → Textual 交互。
+2. 只精读 `command/registry.py`、`command/dispatch.py`、`command/completion.py` 与 `tui.py` 的接线。
+3. 如需 100% tmux 清单，先创建可丢弃的会话和记忆，再补做清空恢复、会话删除、记忆删除三项。
+4. 学习下一章理论内容，并按 `AGENTS.md` 的四文档流程启动开发。
 
 ## 每章验收后的更新模板
 

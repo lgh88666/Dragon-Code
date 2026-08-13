@@ -40,6 +40,16 @@ Screen {
     color: $warning;
 }
 
+#command-completion {
+    width: 1fr;
+    height: auto;
+    max-height: 10;
+    margin: 0 4;
+    padding: 0 1;
+    border: round $accent;
+    background: $surface;
+}
+
 #input-row {
     width: 1fr;
     height: 5;
@@ -77,6 +87,12 @@ Screen {
 #token-usage {
     width: auto;
     margin: 0 2;
+}
+
+#command-hint {
+    width: auto;
+    margin: 0 2;
+    color: $text-muted;
 }
 
 #model-name {
@@ -184,4 +200,83 @@ SessionResumeScreen {
     width: 1fr;
     height: auto;
     max-height: 20;
+}
+
+CommandHelpScreen,
+SessionCommandScreen,
+MemoryCommandScreen,
+PermissionModeScreen,
+ReviewTargetScreen,
+ConfirmCommandScreen {
+    align: center middle;
+    background: $background 70%;
+}
+
+#command-help-dialog,
+#session-command-dialog,
+#memory-command-dialog,
+#permission-mode-dialog,
+#review-target-dialog,
+#confirm-command-dialog {
+    width: 84%;
+    max-width: 100;
+    height: auto;
+    max-height: 84%;
+    border: round $accent;
+    background: $surface;
+    padding: 1 2;
+}
+
+.command-screen-title {
+    width: 1fr;
+    height: 2;
+    text-style: bold;
+}
+
+.command-screen-hint {
+    width: 1fr;
+    height: 1;
+    margin-top: 1;
+    color: $text-muted;
+}
+
+#command-help-body,
+#memory-command-body {
+    width: 1fr;
+    height: 18;
+}
+
+#command-help-options,
+#memory-command-options {
+    width: 45%;
+    height: 1fr;
+}
+
+#command-help-detail,
+#memory-command-detail {
+    width: 55%;
+    height: 1fr;
+    padding: 0 1;
+    color: $text;
+}
+
+#session-command-search,
+#review-target-input {
+    width: 1fr;
+    margin-bottom: 1;
+}
+
+#session-command-options,
+#permission-mode-options,
+#review-target-options,
+#confirm-command-options {
+    width: 1fr;
+    height: auto;
+    max-height: 20;
+}
+
+#confirm-command-target {
+    width: 1fr;
+    height: auto;
+    margin-bottom: 1;
 }

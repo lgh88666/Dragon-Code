@@ -328,3 +328,19 @@ def test_cleanup_uses_last_message_time_not_old_directory_time(tmp_path: Path):
 
     assert deleted == []
     assert directory.exists()
+
+
+def test_delete_non_current_session_and_reject_current(tmp_path: Path):
+    manager = SessionManager(tmp_path)
+    current = manager.open_new("model")
+    target = manager.open_new("model")
+    target.writer.close()
+
+    manager.delete(target.session_id, current.session_id)
+
+    assert not target.writer.jsonl_path.parent.exists()
+    with pytest.raises(ValueError, match="当前会话"):
+        manager.delete(current.session_id, current.session_id)
+    with pytest.raises(ValueError, match="新格式"):
+        manager.delete("../outside", current.session_id)
+    manager.close()

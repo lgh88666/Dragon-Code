@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from dragon_code.memory.manager import INDEX_MAX_BYTES, MemoryManager
+from dragon_code.memory.models import MemoryOperation
 from dragon_code.memory.prompt import build_memory_request
 from dragon_code.models import ChatMessage, LLMEvent, ToolCall
 
@@ -70,6 +71,55 @@ def test_load_indexes_project_then_user(tmp_path: Path):
 
     assert result.index("project-line") < result.index("user-line")
     assert manager.current_index() == result
+
+
+async def test_list_read_count_and_delete_memory(tmp_path: Path):
+    manager = MemoryManager(tmp_path, tmp_path / "home")
+    manager._apply_operations(
+        [
+            MemoryOperation(
+                action="create",
+                level="project",
+                memory_type="project_knowledge",
+                title="项目结构",
+                slug="project-layout",
+                content="项目使用 src 布局。",
+            ),
+            MemoryOperation(
+                action="create",
+                level="user",
+                memory_type="user_preference",
+                title="回复偏好",
+                slug="reply-style",
+                content="使用简洁中文。",
+            ),
+        ]
+    )
+    manager.load_indexes()
+
+    memories = manager.list_memories()
+    assert [(item.level, item.title) for item in memories] == [
+        ("project", "项目结构"),
+        ("user", "回复偏好"),
+    ]
+    assert manager.memory_counts() == (1, 1)
+    project = manager.read_memory("project", "project_knowledge_project-layout.md")
+    assert project.content == "项目使用 src 布局。"
+
+    await manager.delete_memory("project", project.filename)
+
+    assert manager.memory_counts() == (1, 0)
+    assert "项目结构" not in manager.current_index()
+    assert "回复偏好" in manager.current_index()
+
+
+async def test_memory_management_rejects_unsafe_targets(tmp_path: Path):
+    manager = MemoryManager(tmp_path, tmp_path / "home")
+
+    with pytest.raises(ValueError, match="层级"):
+        manager.read_memory("other", "user_preference_test.md")
+    with pytest.raises(ValueError, match="不安全"):
+        await manager.delete_memory("project", "../outside.md")
 
 
 def test_combined_index_is_limited_and_marked(tmp_path: Path):

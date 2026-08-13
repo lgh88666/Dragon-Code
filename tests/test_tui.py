@@ -11,6 +11,17 @@ from textual.events import MouseMove
 from textual.widgets import Input, OptionList, RichLog, Static
 
 from dragon_code.clients.base import LLMError
+from dragon_code.command_screens import (
+    ConfirmCommandScreen,
+    MemoryCommandScreen,
+    MemoryScreenResult,
+    PermissionModeScreen,
+    ReviewTargetScreen,
+    SessionCommandScreen,
+    SessionScreenResult,
+)
+from dragon_code.command_widgets import CommandCompletion
+from dragon_code.memory import MemoryManager, MemoryOperation
 from dragon_code.models import (
     AppConfig,
     ChatMessage,
@@ -27,6 +38,7 @@ from dragon_code.session import Conversation
 from dragon_code.sessions import SessionManager
 from dragon_code.tools import create_default_registry
 from dragon_code.tui import (
+    CommandHelpScreen,
     DragonCodeApp,
     MessageInput,
     PermissionApprovalScreen,
@@ -110,9 +122,262 @@ async def test_single_provider_layout():
         assert "Dragon Code" in banner_text
         assert "Multi-provider coding agent" in banner_text
         assert banner.styles.color == Color.parse("white")
-        assert str(app.query_one("#provider-name", Static).render()) == "default"
+        assert str(app.query_one("#provider-name", Static).render()) == "Fake · default"
         assert str(app.query_one("#model-name", Static).render()) == "fake-model"
         assert app.query_one("#message-input", MessageInput).has_focus
+
+
+async def test_command_completion_fills_then_second_enter_executes():
+    app = app_with_client(FakeClient())
+
+    async with app.run_test(size=(100, 32)) as pilot:
+        input_widget = app.query_one("#message-input", MessageInput)
+        input_widget.load_text("/he")
+        await pilot.pause()
+
+        completion = app.query_one("#command-completion", CommandCompletion)
+        assert completion.display is True
+        assert "/help" in str(completion.render())
+
+        await pilot.press("enter")
+        await pilot.pause()
+        assert input_widget.text == "/help"
+        assert isinstance(app.screen, CommandHelpScreen) is False
+
+        await pilot.press("enter")
+        await pilot.pause()
+        assert isinstance(app.screen, CommandHelpScreen)
+
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not isinstance(app.screen, CommandHelpScreen)
+
+
+async def test_status_is_local_and_contains_complete_snapshot():
+    client = FakeClient()
+    app = app_with_client(client)
+
+    async with app.run_test(size=(100, 32)) as pilot:
+        app.query_one("#message-input", MessageInput).load_text("/status")
+        await pilot.press("enter")
+        await pilot.pause()
+
+        text = "\n".join(line.text for line in app.query_one(RichLog).lines)
+        assert "Dragon Code 状态" in text
+        assert "Provider：Fake" in text
+        assert "工具：内置 6 / MCP 0" in text
+        assert client.requests == []
+        assert app.agent is not None
+        assert app.agent.conversation.get_messages() == []
+
+
+async def test_fast_local_command_does_not_block_next_command():
+    client = FakeClient()
+    app = app_with_client(client)
+
+    async with app.run_test(size=(100, 32)) as pilot:
+        input_widget = app.query_one("#message-input", MessageInput)
+        input_widget.load_text("/status")
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.pause()
+
+        assert app.command_worker is None
+        input_widget.load_text("/help")
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert isinstance(app.screen, CommandHelpScreen)
+        assert client.requests == []
+
+
+async def test_permission_command_switches_runtime_mode_only():
+    app = app_with_client(FakeClient())
+
+    async with app.run_test(size=(100, 32)) as pilot:
+        app.query_one("#message-input", MessageInput).load_text("/permission")
+        await pilot.press("enter")
+        await pilot.pause()
+        assert isinstance(app.screen, PermissionModeScreen)
+
+        await pilot.press("down", "enter")
+        await pilot.pause()
+
+        assert app.agent is not None
+        assert app.agent.mode is PermissionMode.ACCEPT_EDITS
+        assert app.session_state is SessionState.IDLE
+        assert "acceptEdits" in str(app.query_one("#provider-name", Static).render())
+
+
+async def test_clear_creates_new_session_and_preserves_permission(tmp_path: Path):
+    manager = SessionManager(tmp_path)
+    app = DragonCodeApp(
+        AppConfig([provider_config()]),
+        session_manager=manager,
+        client_factory=lambda _config: FakeClient(),
+    )
+
+    async with app.run_test(size=(100, 32)) as pilot:
+        assert app.active_session is not None
+        assert app.agent is not None
+        old_id = app.active_session.session_id
+        app.agent.set_permission_mode(PermissionMode.ACCEPT_EDITS)
+        app.query_one("#message-input", MessageInput).load_text("/clear")
+        await pilot.press("enter")
+        await wait_until_idle(app, pilot)
+
+        assert app.active_session.session_id != old_id
+        assert app.agent.mode is PermissionMode.ACCEPT_EDITS
+        assert app.agent.conversation.get_messages() == []
+        assert (manager.sessions_root / old_id).exists()
+
+
+async def test_memory_status_counts_two_levels(tmp_path: Path):
+    manager = MemoryManager(tmp_path, tmp_path / "home")
+    manager._apply_operations(
+        [
+            MemoryOperation(
+                "create",
+                "project",
+                "project_knowledge",
+                "项目",
+                "project",
+                content="项目知识",
+            ),
+            MemoryOperation(
+                "create",
+                "user",
+                "user_preference",
+                "偏好",
+                "preference",
+                content="用户偏好",
+            ),
+        ]
+    )
+    app = DragonCodeApp(
+        AppConfig([provider_config()]),
+        session_manager=SessionManager(tmp_path),
+        memory_manager=manager,
+        client_factory=lambda _config: FakeClient(),
+    )
+
+    async with app.run_test(size=(100, 32)) as pilot:
+        app.query_one("#message-input", MessageInput).load_text("/status")
+        await pilot.press("enter")
+        await pilot.pause()
+
+        text = "\n".join(line.text for line in app.query_one(RichLog).lines)
+        assert "记忆：用户 1 / 项目 1" in text
+
+
+async def test_review_uses_read_only_tools_and_keeps_mode(tmp_path: Path):
+    (tmp_path / "demo.py").write_text("print('dragon')\n", encoding="utf-8")
+    client = FakeClient(responses=[complete_response("审查报告")])
+    app = DragonCodeApp(
+        AppConfig([provider_config()]),
+        session_manager=SessionManager(tmp_path),
+        client_factory=lambda _config: client,
+    )
+
+    async with app.run_test(size=(100, 32)) as pilot:
+        assert app.agent is not None
+        app.agent.set_permission_mode(PermissionMode.ACCEPT_EDITS)
+        app.query_one("#message-input", MessageInput).load_text("/review")
+        await pilot.press("enter")
+        await pilot.pause()
+        assert isinstance(app.screen, ReviewTargetScreen)
+
+        app.screen.dismiss("demo.py")
+        await wait_until_idle(app, pilot)
+
+        assert [tool.name for tool in client.requests[0].tools] == ["Read", "Glob", "Grep"]
+        assert app.agent.mode is PermissionMode.ACCEPT_EDITS
+        assert app.agent.conversation.get_messages()[0].role == "user"
+        assert "demo.py" in app.agent.conversation.get_messages()[0].content
+
+
+async def test_session_command_confirms_before_deleting(tmp_path: Path):
+    manager = SessionManager(tmp_path)
+    old = manager.open_new("old-model")
+    old.conversation.commit_messages([ChatMessage("user", "旧会话标题")])
+    old_id = old.session_id
+    old.writer.close()
+    app = DragonCodeApp(
+        AppConfig([provider_config()]),
+        session_manager=manager,
+        client_factory=lambda _config: FakeClient(),
+    )
+
+    async with app.run_test(size=(110, 34)) as pilot:
+        app.query_one("#message-input", MessageInput).load_text("/session")
+        await pilot.press("enter")
+        for _ in range(20):
+            await pilot.pause(0.02)
+            if isinstance(app.screen, SessionCommandScreen):
+                break
+        assert isinstance(app.screen, SessionCommandScreen)
+        await pilot.pause()
+
+        app.screen.dismiss(SessionScreenResult("delete", old_id))
+        await pilot.pause()
+        assert isinstance(app.screen, ConfirmCommandScreen)
+        assert (manager.sessions_root / old_id).exists()
+
+        app.screen.dismiss(True)
+        for _ in range(30):
+            await pilot.pause(0.02)
+            if not (manager.sessions_root / old_id).exists():
+                break
+        assert not (manager.sessions_root / old_id).exists()
+
+
+async def test_memory_command_confirms_and_rebuilds_index(tmp_path: Path):
+    memory = MemoryManager(tmp_path, tmp_path / "home")
+    memory._apply_operations(
+        [
+            MemoryOperation(
+                "create",
+                "project",
+                "project_knowledge",
+                "待删除记忆",
+                "delete-me",
+                content="这是一条测试记忆。",
+            )
+        ]
+    )
+    memory.load_indexes()
+    item = memory.list_memories()[0]
+    app = DragonCodeApp(
+        AppConfig([provider_config()]),
+        session_manager=SessionManager(tmp_path),
+        memory_manager=memory,
+        client_factory=lambda _config: FakeClient(),
+    )
+
+    async with app.run_test(size=(110, 34)) as pilot:
+        app.query_one("#message-input", MessageInput).load_text("/memory")
+        await pilot.press("enter")
+        for _ in range(20):
+            await pilot.pause(0.02)
+            if isinstance(app.screen, MemoryCommandScreen):
+                break
+        assert isinstance(app.screen, MemoryCommandScreen)
+        await pilot.pause()
+
+        app.screen.dismiss(MemoryScreenResult("delete", item))
+        await pilot.pause()
+        assert isinstance(app.screen, ConfirmCommandScreen)
+        app.screen.dismiss(True)
+        for _ in range(30):
+            await pilot.pause(0.02)
+            if (
+                not (memory.project_memory_dir / item.filename).exists()
+                and "待删除记忆" not in memory.current_index()
+            ):
+                break
+
+        assert not (memory.project_memory_dir / item.filename).exists()
+        assert "待删除记忆" not in memory.current_index()
 
 
 async def test_multiple_provider_selection():
@@ -131,7 +396,7 @@ async def test_multiple_provider_selection():
         await pilot.pause()
 
         assert app.session_state is SessionState.IDLE
-        assert str(app.query_one("#provider-name", Static).render()) == "default"
+        assert str(app.query_one("#provider-name", Static).render()) == "Two · default"
         assert app.client is not None
         assert app.client.chunks == ["Two"]
 
@@ -261,6 +526,10 @@ async def test_help_and_compact_event_messages_are_visible():
         input_widget = app.query_one("#message-input", MessageInput)
         input_widget.load_text("/help")
         await pilot.press("enter")
+        await pilot.pause()
+        assert isinstance(app.screen, CommandHelpScreen)
+        app.screen.dismiss(None)
+        await pilot.pause()
         app._write_compact_event(CompactEvent("auto_start", before_tokens=20_000))
         app._write_compact_event(
             CompactEvent("auto_complete", before_tokens=20_000, after_tokens=8_000)
@@ -272,7 +541,7 @@ async def test_help_and_compact_event_messages_are_visible():
         conversation = app.query_one("#conversation", RichLog)
         conversation.text_select_all()
         selected = app.screen.get_selected_text() or ""
-        assert "/compact" in selected
+        assert "❯ /help" in selected
         assert "20000 → 8000 Token" in selected
         assert "安全失败" in selected
         assert "已熔断" in selected
@@ -516,7 +785,7 @@ async def test_shift_tab_cycles_permission_modes_and_updates_status():
 
         await pilot.press("shift+tab")
         assert app.agent.mode is PermissionMode.ACCEPT_EDITS
-        assert str(app.query_one("#provider-name", Static).render()) == "acceptEdits"
+        assert str(app.query_one("#provider-name", Static).render()) == "Fake · acceptEdits"
 
         await pilot.press("shift+tab", "shift+tab", "shift+tab")
         assert app.agent.mode is PermissionMode.DEFAULT
@@ -581,7 +850,7 @@ async def test_escape_cancels_permission_without_exiting(tmp_path, monkeypatch):
         assert client.requests[-1].messages[-1].content == "继续"
 
 
-async def test_plan_with_inline_task_and_do_without_plan():
+async def test_plan_rejects_inline_task_and_do_without_plan():
     client = FakeClient(responses=[complete_response("内联计划")])
     app = app_with_client(client)
 
@@ -593,6 +862,15 @@ async def test_plan_with_inline_task_and_do_without_plan():
         assert len(client.requests) == 0
 
         input_widget.load_text("/plan 分析项目结构")
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert client.requests == []
+
+        input_widget.load_text("/plan")
+        await pilot.press("enter")
+        await pilot.pause()
+        input_widget.load_text("分析项目结构")
         await pilot.press("enter")
         await wait_until_idle(app, pilot)
 
@@ -933,7 +1211,7 @@ async def test_resume_during_stream_only_shows_wait_notice():
         await wait_until_idle(app, pilot)
 
         text = "\n".join(line.text for line in app.query_one(RichLog).lines)
-        assert "当前任务结束后才能恢复" in text
+        assert "当前任务结束或取消后再执行命令" in text
 
 
 async def test_session_warning_is_visible_and_next_turn_can_continue(tmp_path):

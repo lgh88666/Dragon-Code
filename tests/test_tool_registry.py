@@ -42,3 +42,12 @@ def test_registry_passes_extra_read_roots_only_to_read(tmp_path):
 
     assert registry.get("Read").extra_read_roots == [memory.resolve()]
     assert not hasattr(registry.get("Write"), "extra_read_roots")
+
+
+def test_registry_counts_builtin_and_mcp_tools(tmp_path):
+    registry = create_default_registry(tmp_path)
+    remote = ReadTool(tmp_path)
+    remote.name = "mcp__demo__read"
+    registry.register(remote)
+
+    assert registry.counts() == (6, 1)

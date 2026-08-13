@@ -90,6 +90,25 @@ class SessionManager:
         active.restore_notices = notices
         return active
 
+    def delete(self, session_id: str, active_session_id: str) -> None:
+        """安全删除一个非当前的新格式会话。"""
+
+        if not is_new_session_id(session_id):
+            raise ValueError("只能删除新格式会话")
+        if session_id == active_session_id:
+            raise ValueError("不能删除当前会话")
+
+        root = self.sessions_root.resolve()
+        target = self.sessions_root / session_id
+        try:
+            resolved = target.resolve(strict=True)
+            resolved.relative_to(root)
+        except (OSError, RuntimeError, ValueError) as error:
+            raise ValueError("目标会话不存在或路径不安全") from error
+        if not resolved.is_dir():
+            raise ValueError("目标会话不是目录")
+        shutil.rmtree(resolved)
+
     def cleanup_expired(self, retention_days: int = 45) -> list[str]:
         if not self.sessions_root.exists():
             return []

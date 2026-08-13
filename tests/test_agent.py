@@ -1078,3 +1078,37 @@ def test_replace_session_resets_plan_and_recounts_turns(tmp_path):
     assert agent.completed_turns == 2
     assert agent.mode is PermissionMode.DEFAULT
     assert agent.has_plan is False
+
+
+def test_replace_session_can_preserve_permission_mode(tmp_path):
+    agent = make_agent(SequenceClient([]), working_dir=tmp_path)
+    agent.set_permission_mode(PermissionMode.ACCEPT_EDITS)
+    agent.has_plan = True
+
+    agent.replace_session(
+        Conversation(),
+        ContextManager(tmp_path, session_id="20260811-120000-abcd"),
+        preserve_mode=True,
+    )
+
+    assert agent.mode is PermissionMode.ACCEPT_EDITS
+    assert agent.has_plan is False
+    assert agent.completed_turns == 0
+
+
+async def test_read_only_run_uses_read_tools_without_changing_mode(tmp_path):
+    client = SequenceClient([response("审查完成")])
+    agent = make_agent(
+        client,
+        registry=create_default_registry(tmp_path),
+        working_dir=tmp_path,
+        permission_mode=PermissionMode.ACCEPT_EDITS,
+    )
+
+    events = [event async for event in agent.run("审查", read_only=True)]
+
+    assert events[-1].type == "completed"
+    assert [tool.name for tool in client.requests[0].tools] == ["Read", "Glob", "Grep"]
+    assert client.requests[0].reminder is None
+    assert agent.mode is PermissionMode.ACCEPT_EDITS
+    assert agent.has_plan is False

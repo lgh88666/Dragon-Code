@@ -26,6 +26,12 @@ class ToolRegistry:
     def definitions(self) -> list[ToolDefinition]:
         return [tool.definition() for tool in self._tools.values()]
 
+    def counts(self) -> tuple[int, int]:
+        """返回内置工具数和 MCP 工具数。"""
+
+        mcp_count = sum(1 for name in self._tools if name.startswith("mcp__"))
+        return len(self._tools) - mcp_count, mcp_count
+
     def subset(self, names: set[str]) -> "ToolRegistry":
         """按原注册顺序返回共享工具实例的子注册中心。"""
 

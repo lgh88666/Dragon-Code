@@ -150,12 +150,13 @@ class Agent:
             ),
         )
 
-    async def run(self, user_text: str):
+    async def run(self, user_text: str, *, read_only: bool = False):
         """运行一个完整任务，异步产出界面所需事件。"""
 
         self.cancel_requested = False
         self.task_usage = TokenUsage(0, 0)
-        active_registry = self.plan_registry if self.mode is PermissionMode.PLAN else self.registry
+        planning = self.mode is PermissionMode.PLAN and not read_only
+        active_registry = self.plan_registry if planning or read_only else self.registry
         self.scheduler = ToolScheduler(active_registry)
         system_prompt = await build_system_prompt(
             self.working_dir,
@@ -177,7 +178,7 @@ class Agent:
                 max_iterations=self.max_iterations,
             )
 
-            reminder = plan_reminder(iteration) if self.mode is PermissionMode.PLAN else None
+            reminder = plan_reminder(iteration) if planning else None
             tool_definitions = active_registry.definitions()
             committed_history = self.conversation.get_messages()
             pending_messages = [] if user_committed else [user_message]
@@ -306,7 +307,7 @@ class Agent:
                 if warning:
                     yield AgentEvent(type="session_warning", text=warning)
 
-                if self.mode is PermissionMode.PLAN:
+                if planning:
                     self.has_plan = True
                 self.completed_turns += 1
                 if self.memory_manager is not None:
@@ -398,15 +399,18 @@ class Agent:
         self,
         conversation: Conversation,
         context_manager: ContextManager,
+        *,
+        preserve_mode: bool = False,
     ) -> None:
         """恢复成功后一次替换会话对象，并清理旧计划状态。"""
 
+        previous_mode = self.mode
         self.conversation = conversation
         self.context_manager = context_manager
         self.completed_turns = sum(
             1 for message in conversation.get_messages() if message.role == "user"
         )
-        self.mode = PermissionMode.DEFAULT
+        self.mode = previous_mode if preserve_mode else PermissionMode.DEFAULT
         self.has_plan = False
         self.cancel_requested = False
 
