@@ -1,6 +1,7 @@
 """Slash Command 核心层测试。"""
 
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -77,6 +78,12 @@ class FakeCommandUI:
     def open_review(self) -> None:
         self.calls.append(("review", None))
 
+    def open_skills(self) -> None:
+        self.calls.append(("skills", None))
+
+    def run_skill(self, name: str, arguments: str = "") -> None:
+        self.calls.append(("run_skill", (name, arguments)))
+
 
 async def _empty_handler(_ui) -> None:
     return None
@@ -103,7 +110,7 @@ def test_registry_registers_twelve_commands_and_aliases():
             "memory",
             "permission",
             "session",
-            "review",
+            "skill",
         ]
     )
     assert registry.find("/HELP") is registry.find("h")
@@ -139,8 +146,8 @@ def test_registry_completion_uses_visible_main_names_only():
 
 def test_parse_command_distinguishes_plain_and_extra_text():
     assert parse_command("hello") is None
-    assert parse_command(" /Help ") == ("help", False)
-    assert parse_command("/help extra") == ("help", True)
+    assert parse_command(" /Help ") == ("help", "")
+    assert parse_command("/help extra text") == ("help", "extra text")
 
 
 async def test_dispatch_plain_unknown_extra_and_busy_inputs():
@@ -172,7 +179,7 @@ async def test_dispatch_plain_unknown_extra_and_busy_inputs():
         ("/session", ("sessions", False)),
         ("/memory", ("memory", None)),
         ("/permission", ("permission", None)),
-        ("/review", ("review", None)),
+        ("/skill", ("skills", None)),
     ],
 )
 async def test_builtin_commands_call_expected_ui_capability(text, expected):
@@ -206,3 +213,38 @@ async def test_handler_error_is_recoverable():
 
     assert await dispatch_command("/broken", registry, ui) is True
     assert ui.messages[-1] == ("命令执行失败：boom", True)
+
+
+async def test_dynamic_skill_command_accepts_raw_arguments():
+    from dragon_code.skills import SkillDefinition
+
+    skill = SkillDefinition(
+        name="demo",
+        description="演示",
+        prompt_body="SOP $ARGUMENTS",
+        allowed_tools=(),
+        mode="inline",
+        model=None,
+        context="full",
+        source_level="project",
+        source_path=Path("SKILL.md"),
+        skill_dir=Path("."),
+    )
+    registry = create_command_registry([skill])
+    ui = FakeCommandUI()
+
+    await dispatch_command("/demo 保留  原始参数", registry, ui)
+
+    assert ui.calls[-1] == ("run_skill", ("demo", "保留  原始参数"))
+
+
+def test_replace_source_is_atomic_on_conflict():
+    registry = CommandRegistry()
+    registry.register(_command("help"))
+    dynamic = replace(_command("demo"), source="skill")
+    registry.replace_source("skill", [dynamic])
+
+    with pytest.raises(ValueError):
+        registry.replace_source("skill", [replace(_command("help"), source="skill")])
+
+    assert registry.find("demo") is dynamic

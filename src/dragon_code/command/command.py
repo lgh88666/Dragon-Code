@@ -20,6 +20,7 @@ class CommandKind(Enum):
 
 
 CommandHandler = Callable[["CommandUI"], Awaitable[None]]
+CommandArgumentHandler = Callable[["CommandUI", str], Awaitable[None]]
 
 
 @dataclass
@@ -33,3 +34,5 @@ class Command:
     kind: CommandKind
     handler: CommandHandler
     hidden: bool = False
+    argument_handler: CommandArgumentHandler | None = None
+    source: str = "builtin"

@@ -14,6 +14,7 @@ from dragon_code.command.command import Command
 from dragon_code.memory import MemoryInfo
 from dragon_code.permissions import PermissionMode
 from dragon_code.sessions import SessionInfo
+from dragon_code.skills import SkillDefinition, SkillLoadIssue
 
 
 class CommandHelpScreen(ModalScreen[None]):
@@ -339,3 +340,68 @@ class ConfirmCommandScreen(ModalScreen[bool]):
 
     def action_cancel(self) -> None:
         self.dismiss(False)
+
+
+@dataclass
+class SkillScreenResult:
+    action: str
+
+
+class SkillManagementScreen(ModalScreen[SkillScreenResult | None]):
+    """查看当前有效 Skill、来源和加载问题。"""
+
+    BINDINGS = [
+        Binding("r", "reload", show=False, priority=True),
+        Binding("escape", "cancel", show=False, priority=True),
+    ]
+
+    def __init__(self, skills: list[SkillDefinition], issues: list[SkillLoadIssue]):
+        super().__init__()
+        self.skills = skills
+        self.issues = issues
+
+    def compose(self) -> ComposeResult:
+        labels = [f"/{item.name}  ·  {item.description}" for item in self.skills]
+        if self.issues:
+            labels.append(f"加载问题（{len(self.issues)}）")
+        with Vertical(id="skill-command-dialog"):
+            yield Static("Dragon Code Skills", classes="command-screen-title")
+            with Horizontal(id="skill-command-body"):
+                yield OptionList(*(labels or ["当前没有可用 Skill"]), id="skill-command-options")
+                yield Static("", id="skill-command-detail")
+            yield Static("↑↓ 查看 · R 重新加载 · Esc 关闭", classes="command-screen-hint")
+
+    def on_mount(self) -> None:
+        options = self.query_one("#skill-command-options", OptionList)
+        options.highlighted = 0
+        options.focus()
+        self._show_detail(0)
+
+    def on_option_list_option_highlighted(self, event: OptionList.OptionHighlighted) -> None:
+        self._show_detail(event.option_index)
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        self._show_detail(event.option_index)
+
+    def action_reload(self) -> None:
+        self.dismiss(SkillScreenResult("reload"))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def _show_detail(self, index: int) -> None:
+        detail = ""
+        if index < len(self.skills):
+            skill = self.skills[index]
+            tools = "、".join(skill.allowed_tools) or "仅系统工具"
+            custom = "、".join(item.name for item in skill.custom_tools) or "无"
+            detail = (
+                f"/{skill.name}\n\n{skill.description}\n\n"
+                f"来源：{skill.source_level}\n文件：{skill.source_path}\n"
+                f"模式：{skill.mode}\n上下文：{skill.context}\n"
+                f"允许工具：{tools}\n自定义工具：{custom}\n\n"
+                "自定义脚本会经过权限判断，但不是操作系统级沙箱。"
+            )
+        elif self.issues:
+            detail = "\n\n".join(f"{item.source_path}\n{item.message}" for item in self.issues)
+        self.query_one("#skill-command-detail", Static).update(detail)

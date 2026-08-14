@@ -7,6 +7,11 @@ from dragon_code.tools import ToolRegistry, create_default_registry
 from dragon_code.tools.file_tools import ReadTool
 
 
+class SystemReadTool(ReadTool):
+    name = "SystemRead"
+    is_system_tool = True
+
+
 def test_default_registry_has_six_tools_and_metadata(tmp_path):
     definitions = create_default_registry(tmp_path).definitions()
     assert [item.name for item in definitions] == ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
@@ -51,3 +56,23 @@ def test_registry_counts_builtin_and_mcp_tools(tmp_path):
     registry.register(remote)
 
     assert registry.counts() == (6, 1)
+
+
+def test_restricted_registry_always_keeps_system_tools(tmp_path):
+    registry = create_default_registry(tmp_path)
+    registry.register(SystemReadTool(tmp_path))
+
+    restricted = registry.restricted({"Read"})
+
+    assert restricted.names() == ["Read", "SystemRead"]
+
+
+def test_combined_does_not_mutate_sources(tmp_path):
+    first = create_default_registry(tmp_path).subset({"Read"})
+    second = ToolRegistry()
+    second.register(SystemReadTool(tmp_path))
+
+    combined = first.combined(second)
+
+    assert combined.names() == ["Read", "SystemRead"]
+    assert first.names() == ["Read"]

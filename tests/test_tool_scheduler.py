@@ -121,3 +121,13 @@ def test_make_cancelled_results_marks_unstarted_tools():
     )
 
     assert [result.error_code for result in results] == ["cancelled", "cancelled"]
+
+
+def test_skill_tools_are_always_partitioned_serially():
+    first = RecordingTool("skill__demo__one", safe=True)
+    second = RecordingTool("skill__demo__two", safe=True)
+    scheduler = make_scheduler(first, second)
+
+    batches = scheduler.partition([ToolCall("1", first.name, {}), ToolCall("2", second.name, {})])
+
+    assert [batch.concurrent for batch in batches] == [False, False]

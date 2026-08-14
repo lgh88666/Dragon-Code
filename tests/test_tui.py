@@ -19,6 +19,7 @@ from dragon_code.command_screens import (
     ReviewTargetScreen,
     SessionCommandScreen,
     SessionScreenResult,
+    SkillManagementScreen,
 )
 from dragon_code.command_widgets import CommandCompletion
 from dragon_code.memory import MemoryManager, MemoryOperation
@@ -290,7 +291,12 @@ async def test_review_uses_read_only_tools_and_keeps_mode(tmp_path: Path):
         app.screen.dismiss("demo.py")
         await wait_until_idle(app, pilot)
 
-        assert [tool.name for tool in client.requests[0].tools] == ["Read", "Glob", "Grep"]
+        assert [tool.name for tool in client.requests[0].tools] == [
+            "Read",
+            "Glob",
+            "Grep",
+            "LoadSkill",
+        ]
         assert app.agent.mode is PermissionMode.ACCEPT_EDITS
         assert app.agent.conversation.get_messages()[0].role == "user"
         assert "demo.py" in app.agent.conversation.get_messages()[0].content
@@ -707,6 +713,7 @@ async def test_plan_mode_and_do_command():
             "Read",
             "Glob",
             "Grep",
+            "LoadSkill",
         ]
 
         input_widget.load_text("/do")
@@ -715,7 +722,8 @@ async def test_plan_mode_and_do_command():
 
         assert app.agent.mode == "default"
         assert client.requests[1].messages[-1].content == DO_PLAN_PROMPT
-        assert len(client.requests[1].tools) == 6
+        assert len(client.requests[1].tools) == 7
+        assert client.requests[1].tools[-1].name == "LoadSkill"
         assert "Default" in str(app.query_one("#ready", Static).render())
 
 
@@ -773,7 +781,27 @@ async def test_app_uses_injected_registry(tmp_path):
     async with app.run_test(size=(90, 30)) as pilot:
         await pilot.pause()
         assert app.agent is not None
-        assert app.agent.registry is registry
+        assert app.agent.registry.get("Read") is registry.get("Read")
+        assert app.agent.registry.get("LoadSkill") is not None
+
+
+async def test_skill_management_screen_lists_builtins_and_reloads():
+    app = app_with_client(FakeClient())
+
+    async with app.run_test(size=(100, 34)) as pilot:
+        app.query_one("#message-input", MessageInput).load_text("/skill")
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert isinstance(app.screen, SkillManagementScreen)
+        assert app.screen.query_one("#skill-command-options", OptionList).option_count >= 3
+        await pilot.press("r")
+        await pilot.pause()
+
+        assert app.session_state is SessionState.IDLE
+        assert app.command_registry.find("review") is not None
+        assert app.command_registry.find("commit") is not None
+        assert app.command_registry.find("test") is not None
 
 
 async def test_shift_tab_cycles_permission_modes_and_updates_status():

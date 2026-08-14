@@ -15,11 +15,11 @@
 
 ## 当前状态
 
-- 已完成：ch02–ch10。
-- 最近完成模块：ch10 Slash Command 内置命令框架。
+- 已完成：ch02–ch11。
+- 最近完成模块：ch11 Skill 系统。
 - ch07 实现提交：`9b0d901 feat: add MCP client integration`。
 - ch08 实现提交：`97d3cd7 feat: add ch08 context management`。
-- ch02–ch08 功能代码已经推送到 GitHub；ch09 已完成本地验收，等待用户明确要求后再推送。
+- ch02–ch08 功能代码已经推送到 GitHub；ch09–ch11 已完成本地提交，当前 `master` 尚未推送的提交需等待用户明确要求后再推送。
 - 下一开发章节开始前，继续执行理论学习与四文档审批硬门槛。
 
 ## 已有能力
@@ -97,12 +97,25 @@
 - `/review` 使用一次性只读工具集合，不改变长期模式，也不允许 Write/Edit/Bash。
 - 教材共同能力保持一致；Dragon Code 额外采用统一空闲保护和交互式管理界面。
 
+### ch11：Skill 系统
+
+- YAML frontmatter + Markdown SOP 的 Skill 格式，支持项目级、用户级和内置级三级覆盖。
+- 启动时只向模型提供稳定的名称/描述摘要，需要时通过 `LoadSkill` 或 Slash Command 加载完整 SOP。
+- inline Skill 复用主 Agent；fork Skill 使用独立 Agent、独立 Conversation 和可选模型覆盖，只把最终摘要回流主会话。
+- `allowedTools` 白名单限制模型可见与可执行工具，多个激活 Skill 取并集，系统工具始终保留。
+- 目录型 Skill 可携带 `tool.json` 和 Python 脚本；脚本通过独立子进程和 JSON stdin/stdout 执行。
+- Skill 自定义工具仍经过黑名单、路径沙箱、规则、权限模式和人在回路，并统一串行调度。
+- `/skill` 提供交互式列表、详情和重载；`/clear`、新建/恢复会话会清除激活状态。
+- commit、review、test 三个内置 Skill 随 wheel 发布；原硬编码 review SOP 已移除，`/review` 与 `/r` 由 review Skill 接管。
+
 ## 当前核心调用链
 
 ```text
 CLI 加载 Provider、权限和 MCP 配置
   ↓
 McpManager 连接 Server、发现工具并注册到 ToolRegistry
+  ↓
+SkillManager 发现三级 Skill，注册 LoadSkill、自定义工具和动态命令
   ↓
 Textual TUI 接收用户输入
   ↓
@@ -138,6 +151,11 @@ TUI 通过 AgentEvent 实时展示文本、工具行、结果和状态
 | `src/dragon_code/command/` | 命令模型、Registry、分发、补全和三类内置 Handler |
 | `src/dragon_code/command_screens.py` | 帮助、会话、记忆、权限、审查和确认交互界面 |
 | `src/dragon_code/command_widgets.py` | Slash Command 实时候选菜单 |
+| `src/dragon_code/skills/parser.py` | SKILL.md 元信息、正文和上限校验 |
+| `src/dragon_code/skills/loader.py` | 三级扫描、覆盖、依赖和失败隔离 |
+| `src/dragon_code/skills/manager.py` | 稳定定义快照和会话级激活状态 |
+| `src/dragon_code/skills/executor.py` | inline/fork 编排、上下文复制和摘要回流 |
+| `src/dragon_code/skills/tools.py` | LoadSkill 与自定义 Python 子进程 Tool 适配 |
 | `src/dragon_code/agent.py` | Agent Loop、模式、权限等待、工具执行和事件输出 |
 | `src/dragon_code/models.py` | 消息、请求、事件、工具调用和用量等统一模型 |
 | `src/dragon_code/clients/base.py` | 协议无关 LLMClient 接口 |
@@ -161,6 +179,19 @@ TUI 通过 AgentEvent 实时展示文本、工具行、结果和状态
 | `src/dragon_code/memory/manager.py` | 自动记忆调度、模型更新、原子文件写入和索引重建 |
 
 ## 最近验证状态
+
+ch11 完成时的证据：
+
+- `uv sync --locked`、format、ruff、compileall 和 wheel 构建全部通过。
+- `uv run pytest -q`：`442 passed, 2 skipped`。
+- wheel 内含 commit、review、test 三个内置 `SKILL.md`。
+- tmux + 真实 Anthropic 兼容 DeepSeek：自然语言 `LoadSkill → Read → 最终摘要` 通过。
+- 目录型 Python Tool 弹出权限确认，JSON 回声 `龙焰测试` 成功回灌并形成最终答复。
+- `/review` fork 实时展示多轮工具事件；Esc 取消后普通对话返回 `OK`。
+- `/skill` 管理界面、reload、`/exit` 和进程清理通过；退出后 `dragon_code_processes=0`。
+- WSL 原生子进程和真实 OpenAI 端点因本机环境未验，自动化路径通过。
+
+完整证据见 `specs/ch11-skill-system/acceptance-report.md`。
 
 ch10 完成时的证据：
 
@@ -223,6 +254,7 @@ ch07 完成时的证据：
 
 ## 学习与回顾状态
 
+- ch11 已完成开发与验收；下一步安排一次只讲核心链路的源码回顾。
 - ch10 已补充一份聚焦 Registry、分流、UI Protocol、补全和只读审查的学习笔记；下一步可进行核心源码回顾。
 - `docs/learning-notes.md` 已系统整理 ch02、ch03、聊天历史复制、ch05，并补充 ch09 核心源码回顾入口。
 - ch06 已进行过对话式核心回顾，但尚未整理成独立的完整学习笔记章节。

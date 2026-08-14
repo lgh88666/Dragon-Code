@@ -50,3 +50,13 @@ class CommandRegistry:
     def complete(self, prefix: str) -> list[Command]:
         normalized = normalize_name(prefix)
         return [command for command in self.visible() if command.name.startswith(normalized)]
+
+    def replace_source(self, source: str, commands: list[Command]) -> None:
+        """校验完整新列表后，原子替换某一来源的动态命令。"""
+
+        kept = [command for command in self._commands if command.source != source]
+        candidate = CommandRegistry()
+        for command in [*kept, *commands]:
+            candidate.register(command)
+        self._commands = candidate._commands
+        self._by_name = candidate._by_name

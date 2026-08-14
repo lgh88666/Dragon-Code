@@ -34,7 +34,6 @@ from dragon_code.command import (
     create_command_registry,
     dispatch_command,
 )
-from dragon_code.command.builtin_prompt import build_review_prompt
 from dragon_code.command_screens import (
     CommandHelpScreen,
     ConfirmCommandScreen,
@@ -44,6 +43,8 @@ from dragon_code.command_screens import (
     ReviewTargetScreen,
     SessionCommandScreen,
     SessionScreenResult,
+    SkillManagementScreen,
+    SkillScreenResult,
 )
 from dragon_code.command_widgets import CommandCompletion
 from dragon_code.context.manager import ContextManager
@@ -62,6 +63,8 @@ from dragon_code.permissions.engine import PermissionEngine
 from dragon_code.permissions.rules import RuleStore
 from dragon_code.prompt import DO_PLAN_PROMPT, build_system_prompt, render_banner
 from dragon_code.sessions import ActiveSession, SessionInfo, SessionManager
+from dragon_code.skills import SkillExecutor, SkillLoader, SkillManager
+from dragon_code.skills.tools import LoadSkillTool, registry_for_skill_tools
 from dragon_code.tools import ToolRegistry, create_default_registry
 
 
@@ -393,6 +396,7 @@ class DragonCodeApp(App):
         session_manager: SessionManager | None = None,
         memory_manager: MemoryManager | None = None,
         custom_instructions: str = "",
+        skill_manager: SkillManager | None = None,
     ):
         super().__init__()
         self.config = config
@@ -400,12 +404,31 @@ class DragonCodeApp(App):
         self.memory_manager = memory_manager
         self.custom_instructions = custom_instructions
         extra_read_roots = [memory_manager.user_memory_dir] if memory_manager is not None else []
-        self.registry = registry or create_default_registry(
+        self.base_registry = registry or create_default_registry(
             self.session_manager.project_root,
             extra_read_roots,
         )
+        self.registry = self.base_registry
+        if skill_manager is None:
+            base_commands = create_command_registry().visible()
+            reserved = {
+                name for command in base_commands for name in (command.name, *command.aliases)
+            }
+            skill_manager = SkillManager(
+                SkillLoader(
+                    self.session_manager.project_root,
+                    user_home=self.session_manager.project_root / ".dragon-code" / "test-home",
+                    reserved_commands=reserved,
+                    base_tool_names=set(self.base_registry.names()) | {"LoadSkill"},
+                )
+            )
+            skill_manager.reload()
+        self.skill_manager = skill_manager
+        self.skill_runtime = None
+        self.skill_executor: SkillExecutor | None = None
         self.client_factory = client_factory
-        self.command_registry = create_command_registry()
+        skills = skill_manager.list_skills() if skill_manager is not None else []
+        self.command_registry = create_command_registry(skills)
         self.completion_state = CompletionState()
         self.session_state = SessionState.SELECTING
         self.active_provider: ProviderConfig | None = None
@@ -491,6 +514,14 @@ class DragonCodeApp(App):
         extra_read_roots = (
             [self.memory_manager.user_memory_dir] if self.memory_manager is not None else []
         )
+        if self.skill_manager is not None:
+            self.skill_runtime = self.skill_manager.create_runtime()
+            skill_registry = registry_for_skill_tools(self.skill_manager.list_skills())
+            system_registry = ToolRegistry()
+            system_registry.register(LoadSkillTool(self.skill_manager, self.skill_runtime))
+            self.registry = self.base_registry.combined(skill_registry, system_registry)
+        else:
+            self.registry = self.base_registry
         self.agent = Agent(
             self.client,
             self.active_session.conversation,
@@ -507,7 +538,15 @@ class DragonCodeApp(App):
             context_manager=context_manager,
             custom_instructions=self.custom_instructions,
             memory_manager=self.memory_manager,
+            skill_manager=self.skill_manager,
+            skill_runtime=self.skill_runtime,
         )
+        if self.skill_manager is not None:
+            self.skill_executor = SkillExecutor(
+                self.skill_manager,
+                self.agent,
+                self.client_factory,
+            )
         self.session_state = SessionState.IDLE
         self._update_permission_mode_display()
         self._set_command_hint(True)
@@ -611,6 +650,8 @@ class DragonCodeApp(App):
         display_text: str | None = None,
         *,
         read_only: bool = False,
+        skill_name: str = "",
+        skill_arguments: str = "",
     ) -> None:
         """更新界面状态并启动异步模型请求。"""
 
@@ -635,8 +676,12 @@ class DragonCodeApp(App):
         self.query_one("#streaming", Static).update("")
         self._update_timer()
         self.timer = self.set_interval(0.1, self._update_timer)
+        if skill_name:
+            event_source = self._consume_skill(skill_name, skill_arguments)
+        else:
+            event_source = self._consume_turn(user_text, read_only=read_only)
         self.stream_worker = self.run_worker(
-            self._consume_turn(user_text, read_only=read_only),
+            event_source,
             name="llm-stream",
             exclusive=True,
             exit_on_error=False,
@@ -649,8 +694,31 @@ class DragonCodeApp(App):
             self._finish_with_error(LLMError("unknown", "当前没有可用的 Provider。"))
             return
 
-        async for event in self.agent.run(user_text, read_only=read_only):
-            if event.type == "progress":
+        await self._consume_event_stream(self.agent.run(user_text, read_only=read_only))
+
+    async def _consume_skill(self, name: str, arguments: str) -> None:
+        if self.skill_executor is None:
+            self._finish_with_error(LLMError("unknown", "当前没有可用的 Skill 执行器。"))
+            return
+        await self._consume_event_stream(self.skill_executor.run_explicit(name, arguments))
+
+    async def _consume_event_stream(self, events) -> None:
+        """让普通 Agent 与 fork Skill 共用同一套 TUI 事件渲染。"""
+
+        async for event in events:
+            if event.type == "skill_start":
+                self.query_one("#conversation", RichLog).write(
+                    Text(f"● {event.text}", style="bold magenta")
+                )
+            elif event.type == "skill_end":
+                self.query_one("#conversation", RichLog).write(
+                    Text(f"● {event.text}", style="bold green")
+                )
+            elif event.type == "skill_warning":
+                self.query_one("#conversation", RichLog).write(
+                    Text(f"● Skill 警告：{event.text}", style="bold yellow")
+                )
+            elif event.type == "progress":
                 self.current_iteration = event.iteration
                 self.max_iterations = event.max_iterations
                 self._update_timer()
@@ -1090,6 +1158,63 @@ class DragonCodeApp(App):
         self._begin_local_command("/review")
         self.push_screen(ReviewTargetScreen(), callback=self._review_target_selected)
 
+    def open_skills(self) -> None:
+        self._begin_local_command("/skill")
+        skills, issues = self.skill_items()
+        self.push_screen(
+            SkillManagementScreen(skills, issues),
+            callback=self._skill_screen_closed,
+        )
+
+    def skill_items(self):
+        if self.skill_manager is None:
+            return [], []
+        return self.skill_manager.list_skills(), self.skill_manager.issues()
+
+    def reload_skills(self):
+        if self.skill_manager is None:
+            return [], []
+        snapshot = self.skill_manager.reload()
+        from dragon_code.command import create_skill_commands
+
+        self.command_registry.replace_source(
+            "skill",
+            create_skill_commands(snapshot.skills),
+        )
+        if self.agent is not None and self.skill_runtime is not None:
+            skill_registry = registry_for_skill_tools(snapshot.skills)
+            system_registry = ToolRegistry()
+            system_registry.register(LoadSkillTool(self.skill_manager, self.skill_runtime))
+            self.registry = self.base_registry.combined(skill_registry, system_registry)
+            self.agent.registry = self.registry
+            self.agent.plan_registry = self.registry.restricted({"Read", "Glob", "Grep"})
+        return list(snapshot.skills), list(snapshot.issues)
+
+    def _skill_screen_closed(self, result: SkillScreenResult | None) -> None:
+        if result is not None and result.action == "reload":
+            skills, issues = self.reload_skills()
+            self.show_message(f"Skill 已重新加载：{len(skills)} 个有效，{len(issues)} 个问题。")
+        self._finish_local_command()
+
+    def run_skill(self, name: str, arguments: str = "") -> None:
+        if self.skill_manager is None or self.agent is None:
+            self.show_message("当前没有可用的 Skill。", error=True)
+            return
+        skill = self.skill_manager.get(name)
+        if skill is None:
+            self.show_message(f"未知 Skill：{name}", error=True)
+            return
+        if name == "review" and not arguments.strip():
+            self.open_review()
+            return
+        display = f"/{name}" + (f" {arguments}" if arguments else "")
+        self._start_turn(
+            f"执行 Skill：{name}",
+            display_text=display,
+            skill_name=name,
+            skill_arguments=arguments,
+        )
+
     def _set_command_hint(self, visible: bool) -> None:
         try:
             self.query_one("#command-hint", Static).display = visible
@@ -1169,6 +1294,8 @@ class DragonCodeApp(App):
             self.timer = None
         if self.agent is not None:
             self.agent.request_cancel()
+        if self.skill_executor is not None:
+            self.skill_executor.request_cancel()
         if self.stream_worker is not None:
             self.stream_worker.cancel()
             self.stream_worker = None
@@ -1196,6 +1323,7 @@ class DragonCodeApp(App):
                 MemoryCommandScreen,
                 PermissionModeScreen,
                 ReviewTargetScreen,
+                SkillManagementScreen,
                 ConfirmCommandScreen,
             ),
         ):
@@ -1210,6 +1338,8 @@ class DragonCodeApp(App):
             and self.agent is not None
         ):
             self.agent.request_cancel()
+            if self.skill_executor is not None:
+                self.skill_executor.request_cancel()
         elif self.session_state is SessionState.RESUMING:
             if isinstance(self.screen, SessionResumeScreen):
                 self.screen.dismiss(None)
@@ -1524,9 +1654,8 @@ class DragonCodeApp(App):
                 resolved.relative_to(root)
                 prompt_target = str(resolved.relative_to(root)) or "."
 
-            prompt = build_review_prompt(prompt_target)
             self._finish_local_command()
-            self._start_turn(prompt, display_text="/review", read_only=True)
+            self.run_skill("review", prompt_target)
         except asyncio.CancelledError:
             self._finish_local_command("代码审查已取消。")
         except Exception as error:

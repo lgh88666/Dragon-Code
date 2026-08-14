@@ -33,3 +33,7 @@ async def handle_memory(ui: CommandUI) -> None:
 
 async def handle_permission(ui: CommandUI) -> None:
     ui.open_permissions()
+
+
+async def handle_skill(ui: CommandUI) -> None:
+    ui.open_skills()

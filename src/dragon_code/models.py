@@ -186,3 +186,4 @@ class AgentEvent:
     error: Exception | None = None
     permission_request: PermissionRequest | None = None
     compact: CompactEvent | None = None
+    skill_name: str = ""

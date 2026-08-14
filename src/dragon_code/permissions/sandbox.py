@@ -2,9 +2,13 @@
 
 import re
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from dragon_code.models import ToolCall
 from dragon_code.permissions.models import PermissionDecision, PermissionResult
+
+if TYPE_CHECKING:
+    from dragon_code.tools.base import Tool
 
 PATH_TOOLS = {"Read", "Write", "Edit", "Glob", "Grep"}
 GLOB_CHARS = "*?["
@@ -90,13 +94,28 @@ class PathSandbox:
             root.expanduser().resolve(strict=False) for root in extra_read_roots or []
         ]
 
-    def check(self, call: ToolCall) -> PermissionResult | None:
+    def check(self, call: ToolCall, tool: "Tool | None" = None) -> PermissionResult | None:
+        if tool is not None and tool.permission_path_arguments:
+            if call.arguments is None:
+                return _deny("工具参数不是有效 JSON，无法检查路径。")
+            for name, access in tool.permission_path_arguments:
+                value = call.arguments.get(name)
+                if not isinstance(value, str) or not value.strip():
+                    return _deny(f"自定义工具缺少有效路径参数：{name}")
+                result = self._check_path(value, allow_extra_read=access == "read")
+                if result is not None:
+                    return result
+            return None
+
         target = extract_target(call)
         if target is None:
             return None
         if isinstance(target, PermissionResult):
             return target
 
+        return self._check_path(target, allow_extra_read=call.name == "Read")
+
+    def _check_path(self, target: str, *, allow_extra_read: bool) -> PermissionResult | None:
         candidate = Path(target).expanduser()
         if not candidate.is_absolute():
             candidate = self.project_root / candidate
@@ -107,7 +126,7 @@ class PathSandbox:
                 else _resolve_new_path(candidate)
             )
             allowed_roots = [self.project_root]
-            if call.name == "Read":
+            if allow_extra_read:
                 allowed_roots.extend(self.extra_read_roots)
             if not any(_is_relative_to(resolved, root) for root in allowed_roots):
                 raise ValueError("目标超出允许根目录")

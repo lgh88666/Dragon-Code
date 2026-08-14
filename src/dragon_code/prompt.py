@@ -124,14 +124,14 @@ def fixed_prompt_modules() -> list[PromptModule]:
 
 def optional_prompt_modules(
     custom_instructions: str = "",
-    active_skills: str = "",
+    available_skills: str = "",
     memory: str = "",
 ) -> list[PromptModule]:
     """返回可选模块；项目指令和长期记忆由 ch09 提供真实来源。"""
 
     return [
         PromptModule("自定义指令", 80, custom_instructions),
-        PromptModule("已激活 Skill", 90, active_skills),
+        PromptModule("可用 Skills", 90, available_skills),
         PromptModule("长期记忆", 100, memory),
     ]
 
@@ -213,13 +213,13 @@ async def build_system_prompt(
     model: str,
     *,
     custom_instructions: str = "",
-    active_skills: str = "",
+    available_skills: str = "",
     memory: str = "",
 ) -> SystemPrompt:
     """构造稳定提示和独立环境块。"""
 
     modules = fixed_prompt_modules()
-    modules.extend(optional_prompt_modules(custom_instructions, active_skills, memory))
+    modules.extend(optional_prompt_modules(custom_instructions, available_skills, memory))
     stable = assemble_system_prompt(modules)
     environment = await gather_environment(working_dir, version, model)
     return SystemPrompt(stable=stable, environment=environment.render())
@@ -241,6 +241,24 @@ def plan_reminder(iteration: int) -> str:
 
     prompt = PLAN_MODE_PROMPT if (iteration - 1) % 5 == 0 else PLAN_MODE_SHORT_PROMPT
     return system_reminder(prompt)
+
+
+def runtime_reminder(
+    iteration: int,
+    *,
+    planning: bool = False,
+    active_skills: str = "",
+) -> str | None:
+    """把 Plan Mode 与已激活 Skill 合并成一个临时系统提醒。"""
+
+    sections = []
+    if planning:
+        sections.append(PLAN_MODE_PROMPT if (iteration - 1) % 5 == 0 else PLAN_MODE_SHORT_PROMPT)
+    if active_skills.strip():
+        sections.append(active_skills.strip())
+    if not sections:
+        return None
+    return system_reminder("\n\n".join(sections))
 
 
 # 用户确认的原创翼形图标，字符和位置不要随意调整。

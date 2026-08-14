@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
     from dragon_code.command.command import Command
+    from dragon_code.skills import SkillDefinition, SkillLoadIssue
 
 
 @dataclass
@@ -58,3 +59,11 @@ class CommandUI(Protocol):
     def open_permissions(self) -> None: ...
 
     def open_review(self) -> None: ...
+
+    def open_skills(self) -> None: ...
+
+    def run_skill(self, name: str, arguments: str = "") -> None: ...
+
+    def skill_items(self) -> tuple[list[SkillDefinition], list[SkillLoadIssue]]: ...
+
+    def reload_skills(self) -> tuple[list[SkillDefinition], list[SkillLoadIssue]]: ...

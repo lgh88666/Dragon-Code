@@ -28,7 +28,7 @@ from dragon_code.permissions import (
 from dragon_code.permissions.approval import ApprovalController
 from dragon_code.permissions.engine import PermissionEngine
 from dragon_code.permissions.rules import RuleParseError, RuleStore, make_exact_rule
-from dragon_code.prompt import build_system_prompt, plan_reminder
+from dragon_code.prompt import build_system_prompt, runtime_reminder
 from dragon_code.session import Conversation
 from dragon_code.stream_collector import StreamCollector
 from dragon_code.tool_scheduler import ToolBatch, ToolScheduler
@@ -36,6 +36,7 @@ from dragon_code.tools.registry import ToolRegistry
 
 if TYPE_CHECKING:
     from dragon_code.memory import MemoryManager
+    from dragon_code.skills import SkillManager, SkillRuntime
 
 ITERATION_LIMIT_MESSAGE = "已达到 Agent Loop 的 50 次迭代上限。"
 UNKNOWN_TOOL_LIMIT_MESSAGE = "模型连续请求未知工具，Agent Loop 已停止。"
@@ -59,18 +60,22 @@ class Agent:
         context_manager: ContextManager | None = None,
         custom_instructions: str = "",
         memory_manager: MemoryManager | None = None,
+        skill_manager: SkillManager | None = None,
+        skill_runtime: SkillRuntime | None = None,
     ):
         self.client = client
         self.conversation = conversation
         self.registry = registry
         self.working_dir = working_dir.resolve()
         self.version = version
-        self.plan_registry = registry.subset({"Read", "Glob", "Grep"})
+        self.plan_registry = registry.restricted({"Read", "Glob", "Grep"})
         self.max_iterations = max_iterations
         self.unknown_tool_limit = unknown_tool_limit
         self.context_manager = context_manager or ContextManager(self.working_dir)
         self.custom_instructions = custom_instructions
         self.memory_manager = memory_manager
+        self.skill_manager = skill_manager
+        self.skill_runtime = skill_runtime
         self.completed_turns = 0
 
         # 默认空规则只用于向后兼容和测试；TUI 启动时会注入真实三级配置。
@@ -156,13 +161,13 @@ class Agent:
         self.cancel_requested = False
         self.task_usage = TokenUsage(0, 0)
         planning = self.mode is PermissionMode.PLAN and not read_only
-        active_registry = self.plan_registry if planning or read_only else self.registry
-        self.scheduler = ToolScheduler(active_registry)
+        base_registry = self.plan_registry if planning or read_only else self.registry
         system_prompt = await build_system_prompt(
             self.working_dir,
             self.version,
             self.client.model,
             custom_instructions=self.custom_instructions,
+            available_skills=self.skill_manager.summary_text() if self.skill_manager else "",
             memory=self.memory_manager.current_index() if self.memory_manager else "",
         )
 
@@ -178,7 +183,19 @@ class Agent:
                 max_iterations=self.max_iterations,
             )
 
-            reminder = plan_reminder(iteration) if planning else None
+            active_registry = base_registry
+            active_skill_text = ""
+            if self.skill_runtime is not None:
+                allowed_names = self.skill_runtime.allowed_tool_names()
+                if allowed_names is not None:
+                    active_registry = base_registry.restricted(allowed_names)
+                active_skill_text = self.skill_runtime.reminder_text()
+            self.scheduler = ToolScheduler(active_registry)
+            reminder = runtime_reminder(
+                iteration,
+                planning=planning,
+                active_skills=active_skill_text,
+            )
             tool_definitions = active_registry.definitions()
             committed_history = self.conversation.get_messages()
             pending_messages = [] if user_committed else [user_message]
@@ -413,6 +430,8 @@ class Agent:
         self.mode = previous_mode if preserve_mode else PermissionMode.DEFAULT
         self.has_plan = False
         self.cancel_requested = False
+        if self.skill_runtime is not None:
+            self.skill_runtime.clear()
 
     async def _execute_tools(self, calls: list[ToolCall]):
         """先检查权限，再按原批次执行并保序返回结果。"""

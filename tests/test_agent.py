@@ -20,6 +20,7 @@ from dragon_code.permissions import ApprovalChoice, PermissionMode, PermissionRe
 from dragon_code.permissions.engine import PermissionEngine
 from dragon_code.permissions.rules import RuleStore
 from dragon_code.session import Conversation
+from dragon_code.skills import SkillDefinition, SkillRuntime
 from dragon_code.tools.base import Tool
 from dragon_code.tools.registry import ToolRegistry, create_default_registry
 
@@ -148,6 +149,11 @@ async def collect_with_approval(agent, choice, text="执行"):
     return events
 
 
+class FakeSkillManager:
+    def summary_text(self):
+        return "以下 Skill 可用：\n- demo: 演示"
+
+
 VALID_SUMMARY = """<analysis>草稿</analysis><summary>
 1. 主要请求和意图：继续任务
 2. 关键技术概念：上下文
@@ -176,6 +182,69 @@ def test_permission_event_model_can_hold_request():
     request = PermissionRequest(call, "需要确认", "Write(a.txt)", "Write(a.txt)")
     event = AgentEvent(type="permission_request", permission_request=request)
     assert event.permission_request is request
+
+
+async def test_active_skill_filters_tools_keeps_system_and_injects_reminder(tmp_path):
+    read = DemoTool("Read")
+    write = DemoTool("Write")
+    system = DemoTool("LoadSkill")
+    system.is_system_tool = True
+    registry = registry_with(read, write, system)
+    runtime = SkillRuntime()
+    path = tmp_path / "SKILL.md"
+    runtime.activate(
+        SkillDefinition(
+            name="demo",
+            description="演示",
+            prompt_body="完整 Skill SOP",
+            allowed_tools=("Read",),
+            mode="inline",
+            model=None,
+            context="full",
+            source_level="project",
+            source_path=path,
+            skill_dir=tmp_path,
+        )
+    )
+    client = SequenceClient([response("完成")])
+    agent = make_agent(
+        client,
+        registry=registry,
+        working_dir=tmp_path,
+        skill_manager=FakeSkillManager(),
+        skill_runtime=runtime,
+    )
+
+    await collect(agent)
+
+    assert [item.name for item in client.requests[0].tools] == ["Read", "LoadSkill"]
+    assert "完整 Skill SOP" in client.requests[0].reminder
+    assert "demo: 演示" in client.requests[0].system.stable
+    assert "完整 Skill SOP" not in client.requests[0].system.stable
+
+
+def test_replace_session_clears_active_skills(tmp_path):
+    runtime = SkillRuntime()
+    path = tmp_path / "SKILL.md"
+    runtime.activate(
+        SkillDefinition(
+            "demo",
+            "演示",
+            "SOP",
+            (),
+            "inline",
+            None,
+            "full",
+            "project",
+            path,
+            tmp_path,
+        )
+    )
+    agent = make_agent(SequenceClient([]), working_dir=tmp_path, skill_runtime=runtime)
+
+    agent.replace_session(Conversation(), ContextManager(tmp_path))
+
+    assert runtime.active_skills() == []
 
 
 def test_permission_mode_cycles_in_fixed_order():

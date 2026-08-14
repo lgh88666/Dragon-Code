@@ -24,6 +24,14 @@ class DemoMcpTool(DemoTool):
     is_concurrency_safe = True
 
 
+class DemoSkillTool(DemoTool):
+    name = "skill__demo__run"
+    category = "command"
+    read_only = False
+    permission_command_arguments = ("command",)
+    permission_path_arguments = (("path", "write"),)
+
+
 def engine(tmp_path):
     return PermissionEngine(
         tmp_path,
@@ -49,7 +57,7 @@ def test_mcp_first_use_asks_in_every_mode(tmp_path):
     for mode in PermissionMode:
         result = permission.check(tool_call, tool, mode)
         assert result.decision is PermissionDecision.ASK
-        assert result.source == "mcp_first_use"
+        assert result.source == "external_first_use"
 
 
 def test_mcp_session_allow_does_not_override_deny_rule(tmp_path):
@@ -163,3 +171,32 @@ def test_mode_matrix(tmp_path):
         permission.check(bash, BashTool(tmp_path), PermissionMode.BYPASS_PERMISSIONS).decision
         is PermissionDecision.ALLOW
     )
+
+
+def test_skill_tool_blacklist_and_sandbox_cannot_be_bypassed(tmp_path):
+    tool = DemoSkillTool()
+    permission = engine(tmp_path)
+
+    dangerous = permission.check(
+        ToolCall("1", tool.name, {"command": "rm -rf /", "path": "ok.txt"}),
+        tool,
+        PermissionMode.BYPASS_PERMISSIONS,
+    )
+    outside = permission.check(
+        ToolCall("2", tool.name, {"command": "echo ok", "path": "../outside.txt"}),
+        tool,
+        PermissionMode.BYPASS_PERMISSIONS,
+    )
+
+    assert dangerous.source == "blacklist"
+    assert outside.source == "sandbox"
+
+
+def test_skill_tool_asks_and_can_be_allowed_for_session(tmp_path):
+    tool = DemoSkillTool()
+    call = ToolCall("1", tool.name, {"command": "echo ok", "path": "ok.txt"})
+    permission = engine(tmp_path)
+
+    assert permission.check(call, tool, PermissionMode.DEFAULT).decision is PermissionDecision.ASK
+    permission.allow_for_session(tool.name)
+    assert permission.check(call, tool, PermissionMode.DEFAULT).source == "session"

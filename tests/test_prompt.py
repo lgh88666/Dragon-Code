@@ -18,6 +18,7 @@ from dragon_code.prompt import (
     optional_prompt_modules,
     plan_reminder,
     render_banner,
+    runtime_reminder,
     system_reminder,
 )
 
@@ -205,6 +206,24 @@ async def test_build_system_prompt_separates_stable_and_environment(monkeypatch,
     assert "model-b" in second.environment
 
 
+async def test_skill_summary_is_stable_but_sop_is_dynamic(monkeypatch, tmp_path):
+    async def no_git(*_args, **_kwargs):
+        return "", ""
+
+    monkeypatch.setattr(prompt_module, "_gather_git_status", no_git)
+    system = await build_system_prompt(
+        tmp_path,
+        "0.1.0",
+        "model",
+        available_skills="以下 Skill 可用：\n- review: 审查代码",
+    )
+    reminder = runtime_reminder(1, active_skills="## 已激活 Skill：review\n完整秘密 SOP")
+
+    assert "review: 审查代码" in system.stable
+    assert "完整秘密 SOP" not in system.stable
+    assert "完整秘密 SOP" in reminder
+
+
 def test_system_reminder_and_plan_frequency():
     reminder = system_reminder("测试约束")
 
@@ -217,3 +236,6 @@ def test_system_reminder_and_plan_frequency():
     assert PLAN_MODE_PROMPT in plan_reminder(6)
     assert PLAN_MODE_PROMPT in plan_reminder(11)
     assert "根据上文" in DO_PLAN_PROMPT
+    combined = runtime_reminder(1, planning=True, active_skills="Skill SOP")
+    assert PLAN_MODE_PROMPT in combined
+    assert "Skill SOP" in combined

@@ -25,6 +25,10 @@ class Tool:
     read_only = True
     destructive = False
     is_concurrency_safe = True
+    is_system_tool = False
+    # Skill 自定义工具可声明需要黑名单或路径沙箱检查的参数名。
+    permission_command_arguments: tuple[str, ...] = ()
+    permission_path_arguments: tuple[tuple[str, str], ...] = ()
     arguments_model: type[BaseModel]
     timeout_seconds = 30.0
 

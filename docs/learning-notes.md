@@ -640,6 +640,56 @@ MessageInput 提交
 
 > 我把 Slash Command 做成注册中心驱动的本地控制层。输入入口先分流，命令通过协议化 UI 接口执行，本地命令不会进入 LLM 历史；帮助和补全都从 Registry 自动生成。对于代码审查，我没有简单切换全局模式，而是给这一轮构造只读工具集合，从能力源头保证不会改代码。
 
+## ch11：Skill 系统
+
+### 先分清三个概念
+
+- **Tool**：模型可以调用的原子能力，例如 Read、Bash 或 MCP 工具。
+- **Command**：用户以 `/` 主动触发的本地入口，负责切换状态、打开界面或发起预设工作流。
+- **Skill**：可复用的 SOP 工作流，告诉 Agent 为某类任务应按什么顺序思考和使用哪些工具；它可以被命令显式触发，也可以由模型通过 `LoadSkill` 自动激活。
+
+### 核心调用链
+
+```text
+项目级 / 用户级 / 内置级 Skill 文件
+  → SkillLoader 解析、校验、覆盖
+  → SkillManager 保存稳定定义快照
+  → System Prompt 只加入名称和描述
+  → Slash Command 或 LoadSkill 选择具体 Skill
+  → SkillRuntime 注入完整 SOP 和 allowedTools
+  → inline 复用主 Agent / fork 创建独立 Agent
+  → ToolRegistry + PermissionEngine 执行实际工具
+  → inline 继续主历史 / fork 只回流最终摘要
+```
+
+### 值得记住的设计
+
+1. **两阶段披露省 Token**：第一阶段只放名称和描述，适合稳定缓存；第二阶段只有命中 Skill 后才注入完整 SOP，避免所有 Skill 每轮都占上下文。
+2. **Skill 不携带已有工具代码**：`allowedTools` 只是白名单，引用 Dragon Code 已经注册的工具。只有目录型 Skill 的 `tool.json` 才声明新增工具和对应脚本。
+3. **白名单是附加限制**：进入白名单不等于自动允许。真正执行时仍经过黑名单、沙箱、规则、权限模式和用户确认。
+4. **多个 inline Skill 取并集**：每个 Skill 都能增加自己需要的工具，但不能借此得到未声明的普通工具；`LoadSkill` 等系统工具始终保留，才能继续嵌套激活。
+5. **inline 与 fork 的区别**：inline 共享主上下文，适合持续协作；fork 使用独立历史，适合代码审查等长任务，主会话只保留最终摘要。
+6. **自定义工具不导入主进程**：Dragon Code 启动独立 Python 子进程，把参数 JSON 写到 stdin，从 stdout 读取 JSON ToolResult；这样脚本崩溃不会直接破坏主进程。
+7. **子进程不是 OS 沙箱**：超时、输出上限和权限检查只能约束声明出来的调用边界，不能阻止脚本源码自己访问网络或系统 API。
+8. **Skill 激活状态属于会话**：`/clear`、新建或恢复会话后必须清除，避免上一会话 SOP 和工具限制泄漏进下一会话。
+9. **热更新保留最后有效版本**：执行前重新解析；新文件有效就替换，无效则警告并继续用旧版本，避免正在工作的会话被一次编辑错误打断。
+
+### 核心源码入口
+
+| 文件 | 阅读重点 |
+|---|---|
+| `skills/parser.py` | frontmatter 如何变成 SkillDefinition |
+| `skills/loader.py` | 项目 > 用户 > 内置的覆盖与错误隔离 |
+| `skills/manager.py` | 稳定快照和 ActiveSkills 为什么分开 |
+| `skills/tools.py` | LoadSkill 与 JSON 子进程 ToolResult |
+| `skills/executor.py` | inline/fork 如何选择、复制上下文和回流摘要 |
+| `agent.py` | 动态 reminder 和工具白名单如何进入每轮请求 |
+| `tui.py` | Slash Command、SkillExecutor 和 AgentEvent 如何接起来 |
+
+### 面试表达
+
+> 我把可复用工作流设计成两阶段加载的 Skill。启动时只把稳定的名称和描述放进提示前缀，命中后才注入完整 SOP；执行时用 allowedTools 收窄能力面，但仍叠加原有权限系统。短任务可以 inline 复用主 Agent，长任务可以 fork 到独立 Agent 并只回流摘要。目录型 Skill 的新增工具通过 JSON 子进程协议运行，从而隔离主进程错误，同时保留超时、输出上限和人在回路。
+
 ## 每章源码回顾模板
 
 ### chXX：[模块名称]

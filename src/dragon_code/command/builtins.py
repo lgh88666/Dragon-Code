@@ -1,7 +1,7 @@
 """集中注册 Dragon Code 的 12 条内置命令。"""
 
 from dragon_code.command.builtin_local import handle_status, make_help_handler
-from dragon_code.command.builtin_prompt import handle_do, handle_review
+from dragon_code.command.builtin_prompt import handle_do
 from dragon_code.command.builtin_ui import (
     handle_clear,
     handle_compact,
@@ -11,13 +11,46 @@ from dragon_code.command.builtin_ui import (
     handle_plan,
     handle_resume,
     handle_session,
+    handle_skill,
 )
 from dragon_code.command.command import Command, CommandKind
 from dragon_code.command.registry import CommandRegistry
 
 
-def create_command_registry() -> CommandRegistry:
-    """创建固定内置命令；本章不支持运行时增删。"""
+async def _dynamic_skill_fallback(_ui) -> None:
+    return None
+
+
+def _skill_argument_handler(name: str):
+    async def handler(ui, arguments: str) -> None:
+        ui.run_skill(name, arguments)
+
+    return handler
+
+
+def create_skill_commands(skills) -> list[Command]:
+    """把当前有效 Skill 转成动态 Slash Command。"""
+
+    commands = []
+    for skill in skills:
+        aliases = ("r",) if skill.name == "review" else ()
+        commands.append(
+            Command(
+                skill.name,
+                aliases,
+                skill.description,
+                f"/{skill.name} [要求]",
+                CommandKind.PROMPT,
+                _dynamic_skill_fallback,
+                argument_handler=_skill_argument_handler(skill.name),
+                source="skill",
+            )
+        )
+    return commands
+
+
+def create_command_registry(skills=()) -> CommandRegistry:
+    """创建内置命令，并原子加入当前有效 Skill 命令。"""
 
     registry = CommandRegistry()
     commands = [
@@ -102,12 +135,12 @@ def create_command_registry() -> CommandRegistry:
             handle_session,
         ),
         Command(
-            "review",
-            ("r",),
-            "以只读方式审查代码",
-            "/review",
+            "skill",
+            (),
+            "查看和重新加载 Skills",
+            "/skill",
             CommandKind.PROMPT,
-            handle_review,
+            handle_skill,
         ),
     ]
     for command in commands:
@@ -124,4 +157,5 @@ def create_command_registry() -> CommandRegistry:
             make_help_handler(registry),
         )
     )
+    registry.replace_source("skill", create_skill_commands(skills))
     return registry

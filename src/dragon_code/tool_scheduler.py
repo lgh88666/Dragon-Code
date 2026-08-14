@@ -30,7 +30,8 @@ class ToolScheduler:
 
         for call in calls:
             tool = self.registry.get(call.name)
-            if tool is not None and tool.is_concurrency_safe:
+            is_skill_tool = call.name.startswith("skill__")
+            if tool is not None and tool.is_concurrency_safe and not is_skill_tool:
                 safe_calls.append(call)
                 continue
 

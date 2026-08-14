@@ -4,11 +4,13 @@ import asyncio
 import sys
 from pathlib import Path
 
+from dragon_code.command import create_command_registry
 from dragon_code.config import ConfigError, load_config
 from dragon_code.instructions import InstructionLoader
 from dragon_code.mcp import McpManager, load_mcp_config
 from dragon_code.memory import MemoryManager
 from dragon_code.sessions import SessionManager
+from dragon_code.skills import SkillLoader, SkillManager
 from dragon_code.tools import create_default_registry
 from dragon_code.tui import DragonCodeApp
 
@@ -60,12 +62,28 @@ async def _run_app(config) -> None:
             except ValueError:
                 print(f"MCP 警告：工具 {tool.name} 重名，已跳过。", file=sys.stderr)
 
+        commands = create_command_registry().visible()
+        reserved_commands = {
+            name for command in commands for name in (command.name, *command.aliases)
+        }
+        skill_manager = SkillManager(
+            SkillLoader(
+                workdir,
+                reserved_commands=reserved_commands,
+                base_tool_names=set(registry.names()) | {"LoadSkill"},
+            )
+        )
+        skill_manager.reload()
+        for issue in skill_manager.issues():
+            print(f"Skill 警告：{issue.message}", file=sys.stderr)
+
         app = DragonCodeApp(
             config,
             registry,
             session_manager=session_manager,
             memory_manager=memory_manager,
             custom_instructions=custom_instructions,
+            skill_manager=skill_manager,
         )
         await app.run_async()
     finally:

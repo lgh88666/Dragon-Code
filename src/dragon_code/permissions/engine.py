@@ -5,7 +5,7 @@ from pathlib import Path
 from dragon_code.models import ToolCall
 from dragon_code.permissions.blacklist import DangerousCommandGuard
 from dragon_code.permissions.models import PermissionDecision, PermissionMode, PermissionResult
-from dragon_code.permissions.rules import RuleStore, is_mcp_tool_name
+from dragon_code.permissions.rules import RuleStore, is_mcp_tool_name, is_skill_tool_name
 from dragon_code.permissions.sandbox import PathSandbox
 from dragon_code.tools.base import Tool
 
@@ -30,7 +30,7 @@ class PermissionEngine:
     def allow_for_session(self, tool_name: str) -> None:
         """仅记录合法 MCP 工具，关闭当前应用后自然失效。"""
 
-        if is_mcp_tool_name(tool_name):
+        if is_mcp_tool_name(tool_name) or is_skill_tool_name(tool_name):
             self.session_allowed_tools.add(tool_name)
 
     def check(
@@ -52,19 +52,20 @@ class PermissionEngine:
                 call.parse_error or "工具参数不是有效 JSON。",
             )
 
-        if call.name == "Bash":
-            command = call.arguments.get("command")
+        command_names = ("command",) if call.name == "Bash" else tool.permission_command_arguments
+        for command_name in command_names:
+            command = call.arguments.get(command_name)
             if not isinstance(command, str) or not command.strip():
                 return PermissionResult(
                     PermissionDecision.DENY,
                     "invalid_arguments",
-                    "Bash 缺少有效的 command。",
+                    f"工具缺少有效的命令参数：{command_name}",
                 )
             blacklist_result = self.blacklist.check(command)
             if blacklist_result is not None:
                 return blacklist_result
 
-        sandbox_result = self.sandbox.check(call)
+        sandbox_result = self.sandbox.check(call, tool)
         if sandbox_result is not None:
             return sandbox_result
 
@@ -72,7 +73,7 @@ class PermissionEngine:
         if rule_result is not None:
             return rule_result
 
-        if is_mcp_tool_name(call.name):
+        if is_mcp_tool_name(call.name) or is_skill_tool_name(call.name):
             if call.name in self.session_allowed_tools:
                 return PermissionResult(
                     PermissionDecision.ALLOW,
@@ -81,8 +82,8 @@ class PermissionEngine:
                 )
             return PermissionResult(
                 PermissionDecision.ASK,
-                "mcp_first_use",
-                "MCP 工具首次使用需要你的允许。",
+                "external_first_use",
+                "外部工具首次使用需要你的允许。",
             )
 
         return self._mode_fallback(tool, mode)
