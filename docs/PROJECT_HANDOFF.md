@@ -15,11 +15,11 @@
 
 ## 当前状态
 
-- 已完成：ch02–ch11。
-- 最近完成模块：ch11 Skill 系统。
+- 已完成：ch02–ch12。
+- 最近完成模块：ch12 Hook 生命周期自动化系统。
 - ch07 实现提交：`9b0d901 feat: add MCP client integration`。
 - ch08 实现提交：`97d3cd7 feat: add ch08 context management`。
-- ch02–ch08 功能代码已经推送到 GitHub；ch09–ch11 已完成本地提交，当前 `master` 尚未推送的提交需等待用户明确要求后再推送。
+- ch02–ch11 已有本地提交；本次将 ch09–ch12 一并推送到 GitHub `master`。
 - 下一开发章节开始前，继续执行理论学习与四文档审批硬门槛。
 
 ## 已有能力
@@ -107,6 +107,17 @@
 - Skill 自定义工具仍经过黑名单、路径沙箱、规则、权限模式和人在回路，并统一串行调度。
 - `/skill` 提供交互式列表、详情和重载；`/clear`、新建/恢复会话会清除激活状态。
 - commit、review、test 三个内置 Skill 随 wheel 发布；原硬编码 review SOP 已移除，`/review` 与 `/r` 由 review Skill 接管。
+
+### ch12：Hook 生命周期自动化系统
+
+- 项目级与用户级 `hooks.yaml` 合并，同名 Hook 由项目级覆盖，错误配置按条隔离。
+- 支持精确、glob、正则、取反以及一层 `all_of`/`any_of` 条件；权限规则复用统一匹配器。
+- Shell、Prompt、HTTP、Subagent 四类动作已接入；Subagent 本章保持安全占位。
+- 11 个生命周期事件贯穿会话、输入、Agent Loop、工具、压缩和通知流程。
+- `UserPromptSubmit` 与 `PreToolUse` 支持同步拦截；拒绝转成可恢复事件或 `hook_denied` 工具结果。
+- 异步 Hook、`only_once`、超时、输出截断、脱敏和退出清理已实现。
+- `/hooks` 仅展示名称、事件、动作类型、来源与控制标记，不泄露命令正文或请求头。
+- tmux 已实测写后动作、写前拦截、输入恢复和长耗时 Hook 退出清理。
 
 ## 当前核心调用链
 

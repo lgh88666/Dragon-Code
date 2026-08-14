@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING
 
 from dragon_code.clients.base import LLMClient, LLMError
 from dragon_code.context.manager import ContextManager
+from dragon_code.hooks import HookEngine
+from dragon_code.hooks.models import HookContext, HookEvent, HookOutcome, HookSnapshot
 from dragon_code.models import (
     AgentEvent,
     ChatMessage,
@@ -28,7 +30,12 @@ from dragon_code.permissions import (
 from dragon_code.permissions.approval import ApprovalController
 from dragon_code.permissions.engine import PermissionEngine
 from dragon_code.permissions.rules import RuleParseError, RuleStore, make_exact_rule
-from dragon_code.prompt import build_system_prompt, runtime_reminder
+from dragon_code.prompt import (
+    build_system_prompt,
+    combine_reminders,
+    hook_notification,
+    runtime_reminder,
+)
 from dragon_code.session import Conversation
 from dragon_code.stream_collector import StreamCollector
 from dragon_code.tool_scheduler import ToolBatch, ToolScheduler
@@ -62,6 +69,7 @@ class Agent:
         memory_manager: MemoryManager | None = None,
         skill_manager: SkillManager | None = None,
         skill_runtime: SkillRuntime | None = None,
+        hook_engine: HookEngine | None = None,
     ):
         self.client = client
         self.conversation = conversation
@@ -76,6 +84,8 @@ class Agent:
         self.memory_manager = memory_manager
         self.skill_manager = skill_manager
         self.skill_runtime = skill_runtime
+        self.hook_engine = hook_engine or HookEngine(HookSnapshot())
+        self.hook_engine.begin_session(self.context_manager.paths.session_id)
         self.completed_turns = 0
 
         # 默认空规则只用于向后兼容和测试；TUI 启动时会注入真实三级配置。
@@ -137,6 +147,12 @@ class Agent:
     async def compact_context(self):
         """手动压缩已提交历史，不发起普通对话请求。"""
 
+        _pre_outcome, pre_events = await self._run_hooks(
+            HookEvent.PRE_COMPACT,
+            {"compact": {"reason": "manual"}},
+        )
+        for event in pre_events:
+            yield event
         outcome = await self.context_manager.force_compact(self.conversation.get_messages())
         phase = "manual_complete" if outcome.success else "manual_failed"
         if outcome.success:
@@ -154,6 +170,19 @@ class Agent:
                 message=outcome.stats.error,
             ),
         )
+        post_outcome, post_events = await self._run_hooks(
+            HookEvent.POST_COMPACT,
+            {
+                "compact": {
+                    "reason": "manual",
+                    "success": outcome.success,
+                    "before_tokens": outcome.stats.before_tokens,
+                    "after_tokens": outcome.stats.after_tokens,
+                }
+            },
+        )
+        for event in post_events:
+            yield event
 
     async def run(self, user_text: str, *, read_only: bool = False):
         """运行一个完整任务，异步产出界面所需事件。"""
@@ -171,12 +200,29 @@ class Agent:
             memory=self.memory_manager.current_index() if self.memory_manager else "",
         )
 
+        submit_outcome, submit_events = await self._run_hooks(
+            HookEvent.USER_PROMPT_SUBMIT,
+            {"user": {"text": user_text}},
+        )
+        for event in submit_events:
+            yield event
+        if submit_outcome.blocked:
+            yield AgentEvent(
+                type="user_rejected",
+                text=submit_outcome.reason,
+                rejected_text=user_text,
+                usage=self.task_usage,
+            )
+            return
+
         user_message = ChatMessage(role="user", content=user_text)
         turn_messages = [copy.deepcopy(user_message)]
         user_committed = False
         unknown_rounds = 0
 
         for iteration in range(1, self.max_iterations + 1):
+            for execution in self.hook_engine.drain_background_results():
+                yield AgentEvent(type="hook", hook_execution=execution)
             yield AgentEvent(
                 type="progress",
                 iteration=iteration,
@@ -191,10 +237,19 @@ class Agent:
                     active_registry = base_registry.restricted(allowed_names)
                 active_skill_text = self.skill_runtime.reminder_text()
             self.scheduler = ToolScheduler(active_registry)
-            reminder = runtime_reminder(
-                iteration,
-                planning=planning,
-                active_skills=active_skill_text,
+            _pre_user_outcome, pre_user_events = await self._run_hooks(
+                HookEvent.PRE_USER_MESSAGE,
+                {"iteration": iteration},
+            )
+            for event in pre_user_events:
+                yield event
+            reminder = combine_reminders(
+                runtime_reminder(
+                    iteration,
+                    planning=planning,
+                    active_skills=active_skill_text,
+                ),
+                hook_notification(self.hook_engine.take_reminders()),
             )
             tool_definitions = active_registry.definitions()
             committed_history = self.conversation.get_messages()
@@ -209,6 +264,12 @@ class Agent:
                 candidate_request
             )
             if will_compact:
+                _pre_compact, hook_events = await self._run_hooks(
+                    HookEvent.PRE_COMPACT,
+                    {"compact": {"reason": "auto", "before_tokens": before_tokens}},
+                )
+                for event in hook_events:
+                    yield event
                 yield AgentEvent(
                     type="compact",
                     compact=CompactEvent(
@@ -242,6 +303,19 @@ class Agent:
                     warning = self.conversation.take_persistence_warning()
                     if warning:
                         yield AgentEvent(type="session_warning", text=warning)
+                post_compact, hook_events = await self._run_hooks(
+                    HookEvent.POST_COMPACT,
+                    {
+                        "compact": {
+                            "reason": "auto",
+                            "success": prepared.compact.success,
+                            "before_tokens": stats.before_tokens,
+                            "after_tokens": stats.after_tokens,
+                        }
+                    },
+                )
+                for event in hook_events:
+                    yield event
             if prepared.circuit_tripped:
                 yield AgentEvent(
                     type="compact",
@@ -282,6 +356,12 @@ class Agent:
                     if agent_event is not None:
                         yield agent_event
             except LLMError as error:
+                _notification, hook_events = await self._run_hooks(
+                    HookEvent.NOTIFICATION,
+                    {"notification": {"kind": "stream_error", "message": str(error)}},
+                )
+                for event in hook_events:
+                    yield event
                 yield AgentEvent(type="error", error=error, usage=self.task_usage)
                 return
             finally:
@@ -301,6 +381,12 @@ class Agent:
             try:
                 response = collector.finish()
             except LLMError as error:
+                _notification, hook_events = await self._run_hooks(
+                    HookEvent.NOTIFICATION,
+                    {"notification": {"kind": "stream_error", "message": str(error)}},
+                )
+                for event in hook_events:
+                    yield event
                 yield AgentEvent(type="error", error=error, usage=self.task_usage)
                 return
 
@@ -334,6 +420,15 @@ class Agent:
                         self.completed_turns,
                         user_text,
                     )
+                _stop_outcome, stop_events = await self._run_hooks(
+                    HookEvent.STOP,
+                    {
+                        "response": {"text": assistant_message.content},
+                        "usage": self.task_usage.__dict__,
+                    },
+                )
+                for event in stop_events:
+                    yield event
                 yield AgentEvent(
                     type="completed",
                     text=assistant_message.content,
@@ -432,6 +527,37 @@ class Agent:
         self.cancel_requested = False
         if self.skill_runtime is not None:
             self.skill_runtime.clear()
+        self.hook_engine.begin_session(self.context_manager.paths.session_id)
+
+    async def _run_hooks(
+        self,
+        event: HookEvent,
+        data: dict[str, object] | None = None,
+    ) -> tuple[HookOutcome, list[AgentEvent]]:
+        """统一创建上下文并把 Hook 结果转换成 AgentEvent。"""
+
+        context = HookContext(
+            event=event,
+            session_id=self.context_manager.paths.session_id,
+            cwd=self.working_dir,
+            mode=self.mode.value,
+            data=data or {},
+        )
+        outcome = await self.hook_engine.trigger(context)
+        events = [
+            AgentEvent(type="hook", hook_execution=execution) for execution in outcome.executions
+        ]
+        return outcome, events
+
+    async def trigger_hook_event(
+        self,
+        event: HookEvent,
+        data: dict[str, object] | None = None,
+    ) -> list[AgentEvent]:
+        """供 TUI 的会话生命周期节点复用同一 Hook 入口。"""
+
+        _outcome, events = await self._run_hooks(event, data)
+        return events
 
     async def _execute_tools(self, calls: list[ToolCall]):
         """先检查权限，再按原批次执行并保序返回结果。"""
@@ -455,6 +581,26 @@ class Agent:
             allowed_indexes: list[int] = []
 
             for call_index, call in enumerate(batch.calls):
+                hook_outcome, hook_events = await self._run_hooks(
+                    HookEvent.PRE_TOOL_USE,
+                    {
+                        "tool": {"id": call.id, "name": call.name},
+                        "args": call.arguments or {},
+                    },
+                )
+                for event in hook_events:
+                    yield event
+                if hook_outcome.blocked:
+                    results[call_index] = ToolResult(
+                        call_id=call.id,
+                        tool_name=call.name,
+                        success=False,
+                        error_code="hook_denied",
+                        error_message=hook_outcome.reason,
+                        metadata={"hook": True},
+                    )
+                    continue
+
                 permission = self.permission_engine.check(
                     call,
                     self.scheduler.registry.get(call.name),
@@ -465,6 +611,18 @@ class Agent:
                     continue
 
                 if permission.decision is PermissionDecision.ASK:
+                    _notification, notification_events = await self._run_hooks(
+                        HookEvent.NOTIFICATION,
+                        {
+                            "notification": {
+                                "kind": "permission_request",
+                                "message": permission.reason,
+                            },
+                            "tool": {"id": call.id, "name": call.name},
+                        },
+                    )
+                    for event in notification_events:
+                        yield event
                     try:
                         exact_rule = make_exact_rule(call, self.working_dir)
                     except RuleParseError:
@@ -535,6 +693,22 @@ class Agent:
                         error_code="tool_error",
                         error_message="工具没有产生可用结果。",
                     )
+                _post_outcome, post_events = await self._run_hooks(
+                    HookEvent.POST_TOOL_USE,
+                    {
+                        "tool": {"id": call.id, "name": call.name},
+                        "args": call.arguments or {},
+                        "result": {
+                            "success": result.success,
+                            "content": result.content,
+                            "error_code": result.error_code,
+                            "error_message": result.error_message,
+                            "truncated": result.truncated,
+                        },
+                    },
+                )
+                for event in post_events:
+                    yield event
                 yield AgentEvent(type="tool_end", tool_result=result)
 
             if self.cancel_requested:

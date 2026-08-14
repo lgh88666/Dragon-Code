@@ -1,0 +1,27 @@
+# Dragon Code Hook 示例。复制为 hooks.yaml 后才会生效。
+hooks:
+  - name: format-python-after-write
+    event: PostToolUse
+    if:
+      all_of:
+        - 'tool.name glob "Write"'
+        - 'args.path glob "**/*.py"'
+        - 'result.success == "true"'
+    action:
+      type: shell
+      command: uv run ruff format .
+    timeout: 20
+
+  - name: remind-after-edit
+    event: PostToolUse
+    if: 'tool.name glob "Edit"'
+    action:
+      type: prompt
+      prompt: "文件 {{args.path}} 已编辑，请记得运行相关测试。"
+
+  - name: session-welcome
+    event: SessionStart
+    only_once: true
+    action:
+      type: prompt
+      prompt: "本会话已启用项目自动化 Hook。"

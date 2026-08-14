@@ -81,6 +81,9 @@ class FakeCommandUI:
     def open_skills(self) -> None:
         self.calls.append(("skills", None))
 
+    def hook_items(self):
+        return [], []
+
     def run_skill(self, name: str, arguments: str = "") -> None:
         self.calls.append(("run_skill", (name, arguments)))
 
@@ -93,7 +96,7 @@ def _command(name: str, aliases: tuple[str, ...] = (), *, hidden: bool = False) 
     return Command(name, aliases, "描述", f"/{name}", CommandKind.LOCAL, _empty_handler, hidden)
 
 
-def test_registry_registers_twelve_commands_and_aliases():
+def test_registry_registers_builtin_commands_and_aliases():
     registry = create_command_registry()
 
     names = [command.name for command in registry.visible()]
@@ -106,6 +109,7 @@ def test_registry_registers_twelve_commands_and_aliases():
             "resume",
             "clear",
             "help",
+            "hooks",
             "status",
             "memory",
             "permission",
@@ -194,13 +198,19 @@ async def test_help_and_status_are_registry_driven():
 
     await dispatch_command("/help", registry, ui)
     assert ui.calls[-1][0] == "help"
-    assert len(ui.calls[-1][1]) == 12
+    assert len(ui.calls[-1][1]) == 13
 
     await dispatch_command("/status", registry, ui)
     text, error = ui.messages[-1]
     assert error is False
     assert "Provider：Fake" in text
     assert "工具：内置 6 / MCP 1" in text
+
+
+async def test_hooks_command_has_clear_empty_state():
+    ui = FakeCommandUI()
+    await dispatch_command("/hooks", create_command_registry(), ui)
+    assert ui.messages[-1] == ("当前没有加载任何 Hook。", False)
 
 
 async def test_handler_error_is_recoverable():

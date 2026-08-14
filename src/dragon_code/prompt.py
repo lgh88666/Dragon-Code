@@ -261,6 +261,20 @@ def runtime_reminder(
     return system_reminder("\n\n".join(sections))
 
 
+def hook_notification(contents: list[str]) -> str | None:
+    """合并本轮等待注入的 Hook 提醒。"""
+
+    values = [content.strip() for content in contents if content.strip()]
+    return "\n\n".join(values) if values else None
+
+
+def combine_reminders(*reminders: str | None) -> str | None:
+    """合并 Plan、Skill 和 Hook 提醒，不写入持久历史。"""
+
+    values = [reminder.strip() for reminder in reminders if reminder and reminder.strip()]
+    return "\n\n".join(values) if values else None
+
+
 # 用户确认的原创翼形图标，字符和位置不要随意调整。
 DRAGON_BANNER = """
  ▗▄   ▄▖

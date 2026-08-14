@@ -1,6 +1,6 @@
-"""集中注册 Dragon Code 的 12 条内置命令。"""
+"""集中注册 Dragon Code 的 13 条内置命令。"""
 
-from dragon_code.command.builtin_local import handle_status, make_help_handler
+from dragon_code.command.builtin_local import handle_hooks, handle_status, make_help_handler
 from dragon_code.command.builtin_prompt import handle_do
 from dragon_code.command.builtin_ui import (
     handle_clear,
@@ -54,6 +54,14 @@ def create_command_registry(skills=()) -> CommandRegistry:
 
     registry = CommandRegistry()
     commands = [
+        Command(
+            "hooks",
+            (),
+            "查看当前已加载的生命周期 Hook",
+            "/hooks",
+            CommandKind.LOCAL,
+            handle_hooks,
+        ),
         Command(
             "exit",
             ("q", "quit"),

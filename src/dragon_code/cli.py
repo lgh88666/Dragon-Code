@@ -6,6 +6,7 @@ from pathlib import Path
 
 from dragon_code.command import create_command_registry
 from dragon_code.config import ConfigError, load_config
+from dragon_code.hooks import HookEngine, HookLoader
 from dragon_code.instructions import InstructionLoader
 from dragon_code.mcp import McpManager, load_mcp_config
 from dragon_code.memory import MemoryManager
@@ -50,6 +51,10 @@ async def _run_app(config) -> None:
     registry = create_default_registry(workdir, [memory_manager.user_memory_dir])
     mcp_config = load_mcp_config(Path(DEFAULT_CONFIG_PATH))
     manager = McpManager(mcp_config)
+    hook_snapshot = HookLoader(workdir).load()
+    hook_engine = HookEngine(hook_snapshot)
+    for issue in hook_snapshot.issues:
+        print(f"Hook 警告：{issue.message}", file=sys.stderr)
 
     try:
         await manager.start()
@@ -84,9 +89,11 @@ async def _run_app(config) -> None:
             memory_manager=memory_manager,
             custom_instructions=custom_instructions,
             skill_manager=skill_manager,
+            hook_engine=hook_engine,
         )
         await app.run_async()
     finally:
+        await hook_engine.close()
         session_manager.close()
         await memory_manager.close()
         if not cleanup_task.done():

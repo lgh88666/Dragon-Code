@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from dragon_code.hooks.models import HookExecution
     from dragon_code.permissions.models import PermissionRequest
 
 
@@ -187,3 +188,5 @@ class AgentEvent:
     permission_request: PermissionRequest | None = None
     compact: CompactEvent | None = None
     skill_name: str = ""
+    hook_execution: HookExecution | None = None
+    rejected_text: str = ""

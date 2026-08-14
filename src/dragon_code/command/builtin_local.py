@@ -17,6 +17,28 @@ async def handle_status(ui: CommandUI) -> None:
     ui.show_message(format_status(ui.get_status()))
 
 
+async def handle_hooks(ui: CommandUI) -> None:
+    """只展示安全元信息，不回显命令、Header 或正文。"""
+
+    hooks, issues = ui.hook_items()
+    if not hooks and not issues:
+        ui.show_message("当前没有加载任何 Hook。")
+        return
+    lines = ["已加载 Hook"]
+    for hook in hooks:
+        lines.append(
+            f"- {hook.name} · {hook.event.value} · {hook.action.type.value} · "
+            f"{hook.source} · once={str(hook.only_once).lower()} · "
+            f"async={str(hook.run_async).lower()}"
+        )
+    if issues:
+        lines.append("配置问题")
+        for issue in issues:
+            name = issue.hook_name or "文件"
+            lines.append(f"- {name}：{issue.message}")
+    ui.show_message("\n".join(lines))
+
+
 def format_status(status: CommandStatus) -> str:
     """把状态快照转换成适合终端阅读的文本。"""
 

@@ -49,6 +49,8 @@ from dragon_code.command_screens import (
 from dragon_code.command_widgets import CommandCompletion
 from dragon_code.context.manager import ContextManager
 from dragon_code.context.summary import estimate_message_tokens
+from dragon_code.hooks import HookEngine
+from dragon_code.hooks.models import HookEvent, HookExecution, HookSnapshot
 from dragon_code.memory import MemoryInfo, MemoryManager
 from dragon_code.models import (
     AppConfig,
@@ -397,6 +399,7 @@ class DragonCodeApp(App):
         memory_manager: MemoryManager | None = None,
         custom_instructions: str = "",
         skill_manager: SkillManager | None = None,
+        hook_engine: HookEngine | None = None,
     ):
         super().__init__()
         self.config = config
@@ -424,6 +427,7 @@ class DragonCodeApp(App):
             )
             skill_manager.reload()
         self.skill_manager = skill_manager
+        self.hook_engine = hook_engine or HookEngine(HookSnapshot())
         self.skill_runtime = None
         self.skill_executor: SkillExecutor | None = None
         self.client_factory = client_factory
@@ -450,6 +454,9 @@ class DragonCodeApp(App):
         self.session_usage = TokenUsage(0, 0)
         self.task_usage_committed = False
         self.pending_permission_call_id = ""
+        self.hook_worker: Worker | None = None
+        self.hook_poll_timer: Timer | None = None
+        self.quitting = False
 
     def compose(self) -> ComposeResult:
         yield Static(render_banner(__version__, os.getcwd()), id="banner")
@@ -473,6 +480,7 @@ class DragonCodeApp(App):
             yield Static("", id="model-name")
 
     def on_mount(self) -> None:
+        self.hook_poll_timer = self.set_interval(0.2, self._poll_hook_results)
         if len(self.config.providers) == 1:
             self._activate_provider(0)
             return
@@ -540,6 +548,7 @@ class DragonCodeApp(App):
             memory_manager=self.memory_manager,
             skill_manager=self.skill_manager,
             skill_runtime=self.skill_runtime,
+            hook_engine=self.hook_engine,
         )
         if self.skill_manager is not None:
             self.skill_executor = SkillExecutor(
@@ -547,11 +556,26 @@ class DragonCodeApp(App):
                 self.agent,
                 self.client_factory,
             )
-        self.session_state = SessionState.IDLE
+        # SessionStart Hook 完成前暂不接受首条输入，避免首轮漏掉启动提醒。
+        self.session_state = SessionState.COMMAND
         self._update_permission_mode_display()
         self._set_command_hint(True)
         self.query_one("#model-name", Static).update(self.client.model)
-        self.query_one("#message-input", MessageInput).focus()
+        self.query_one("#message-input", MessageInput).disabled = True
+        self.hook_worker = self.run_worker(
+            self._complete_activation(),
+            name="hook-session-start",
+            exclusive=False,
+            exit_on_error=False,
+        )
+
+    async def _complete_activation(self) -> None:
+        await self._trigger_lifecycle(HookEvent.SESSION_START)
+        self.hook_worker = None
+        self.session_state = SessionState.IDLE
+        input_widget = self.query_one("#message-input", MessageInput)
+        input_widget.disabled = False
+        input_widget.focus()
 
     def on_message_input_submitted(self, event: MessageInput.Submitted) -> None:
         """接收输入框提交事件。"""
@@ -718,6 +742,8 @@ class DragonCodeApp(App):
                 self.query_one("#conversation", RichLog).write(
                     Text(f"● Skill 警告：{event.text}", style="bold yellow")
                 )
+            elif event.type == "hook" and event.hook_execution is not None:
+                self._write_hook_execution(event.hook_execution)
             elif event.type == "progress":
                 self.current_iteration = event.iteration
                 self.max_iterations = event.max_iterations
@@ -748,6 +774,13 @@ class DragonCodeApp(App):
                 self._finish_with_status(event.text, "bold yellow", event.usage)
             elif event.type == "limit":
                 self._finish_with_status(event.text, "bold yellow", event.usage)
+            elif event.type == "user_rejected":
+                self._finish_with_status(
+                    f"输入被 Hook 拒绝：{event.text}",
+                    "bold red",
+                    event.usage,
+                )
+                self.query_one("#message-input", MessageInput).load_text(event.rejected_text)
             elif event.type == "error":
                 error = event.error
                 if isinstance(error, LLMError):
@@ -757,6 +790,37 @@ class DragonCodeApp(App):
                         LLMError("unknown", "模型请求失败，请稍后再试。"),
                         event.usage,
                     )
+
+    def _write_hook_execution(self, execution: HookExecution) -> None:
+        """以简短且可区分的样式显示 Hook 状态。"""
+
+        if execution.blocked or execution.status == "failed":
+            style = "bold red"
+        elif execution.status in {"timeout", "not_implemented", "scheduled"}:
+            style = "bold yellow"
+        else:
+            style = "magenta"
+        message = execution.message or execution.status
+        self.query_one("#conversation", RichLog).write(
+            Text(f"● Hook {execution.hook_name}：{message}", style=style)
+        )
+
+    async def _trigger_lifecycle(
+        self,
+        event: HookEvent,
+        data: dict[str, object] | None = None,
+    ) -> None:
+        if self.agent is None:
+            return
+        for agent_event in await self.agent.trigger_hook_event(event, data):
+            if agent_event.hook_execution is not None:
+                self._write_hook_execution(agent_event.hook_execution)
+
+    def _poll_hook_results(self) -> None:
+        """轻量轮询已完成异步 Hook，不阻塞 Textual。"""
+
+        for execution in self.hook_engine.drain_background_results():
+            self._write_hook_execution(execution)
 
     def _start_manual_compact(self) -> None:
         """在空闲状态启动一次不进入普通对话的强制压缩。"""
@@ -1166,6 +1230,9 @@ class DragonCodeApp(App):
             callback=self._skill_screen_closed,
         )
 
+    def hook_items(self):
+        return list(self.hook_engine.snapshot.hooks), list(self.hook_engine.snapshot.issues)
+
     def skill_items(self):
         if self.skill_manager is None:
             return [], []
@@ -1257,12 +1324,15 @@ class DragonCodeApp(App):
                 context_window=self.client.config.context_window,
             )
             old_session = self.active_session
+            await self._trigger_lifecycle(HookEvent.SESSION_END, {"reason": "clear"})
+            await self.hook_engine.close()
             self.agent.replace_session(
                 new_session.conversation,
                 context_manager,
                 preserve_mode=True,
             )
             self.active_session = new_session
+            await self._trigger_lifecycle(HookEvent.SESSION_START, {"reason": "clear"})
             self.session_usage = TokenUsage(0, 0)
             self.task_usage = TokenUsage(0, 0)
             self._update_usage_status(self.session_usage)
@@ -1287,7 +1357,31 @@ class DragonCodeApp(App):
         self.open_help(self.command_registry.visible())
 
     def action_safe_quit(self) -> None:
-        """清理计时器和 Worker 后退出。"""
+        """先触发会话结束 Hook，再清理资源并退出。"""
+
+        if self.quitting:
+            return
+        self.quitting = True
+        if self.agent is not None:
+            self.agent.request_cancel()
+        if self.skill_executor is not None:
+            self.skill_executor.request_cancel()
+        self.hook_worker = self.run_worker(
+            self._quit_after_hooks(),
+            name="hook-session-end",
+            exclusive=False,
+            exit_on_error=False,
+        )
+
+    async def _quit_after_hooks(self) -> None:
+        try:
+            await self._trigger_lifecycle(HookEvent.SESSION_END, {"reason": "exit"})
+        finally:
+            await self.hook_engine.close()
+            self._perform_safe_quit()
+
+    def _perform_safe_quit(self) -> None:
+        """清理计时器和现有 Worker，恢复终端。"""
 
         if self.timer is not None:
             self.timer.stop()
@@ -1453,8 +1547,11 @@ class DragonCodeApp(App):
                 new_session.conversation.replace_messages(outcome.history)
 
             old_session = self.active_session
+            await self._trigger_lifecycle(HookEvent.SESSION_END, {"reason": "resume"})
+            await self.hook_engine.close()
             self.agent.replace_session(new_session.conversation, context_manager)
             self.active_session = new_session
+            await self._trigger_lifecycle(HookEvent.SESSION_RESUME, {"reason": "resume"})
             if old_session is not None:
                 old_session.writer.close()
 

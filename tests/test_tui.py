@@ -22,6 +22,15 @@ from dragon_code.command_screens import (
     SkillManagementScreen,
 )
 from dragon_code.command_widgets import CommandCompletion
+from dragon_code.hooks import HookEngine
+from dragon_code.hooks.models import (
+    HookAction,
+    HookActionType,
+    HookDefinition,
+    HookEvent,
+    HookExecution,
+    HookSnapshot,
+)
 from dragon_code.memory import MemoryManager, MemoryOperation
 from dragon_code.models import (
     AppConfig,
@@ -70,6 +79,24 @@ VALID_SUMMARY = """<analysis>草稿</analysis><summary>
 def app_with_client(fake_client: FakeClient) -> DragonCodeApp:
     config = AppConfig([provider_config(fake_client.name, fake_client.model)])
     return DragonCodeApp(config, client_factory=lambda _config: fake_client)
+
+
+class BlockingHookExecutor:
+    async def execute(self, hook, _context):
+        return HookExecution(hook.name, hook.action.type, "blocked", "输入不符合规则", True)
+
+
+class RecordingHookExecutor:
+    def __init__(self):
+        self.events = []
+
+    async def execute(self, hook, context):
+        self.events.append(context.event)
+        return HookExecution(hook.name, hook.action.type, "success", "recorded")
+
+
+def hook_definition(name: str, event: HookEvent, action: HookAction) -> HookDefinition:
+    return HookDefinition(name, event, None, action, timeout=1)
 
 
 def complete_response(
@@ -1129,6 +1156,115 @@ async def test_narrow_terminal_keeps_main_widgets():
         assert app.query_one("#conversation", RichLog).region.width > 0
         assert app.query_one("#message-input", MessageInput).region.width > 0
         assert Path(app.CSS_PATH).name == "dragon_code.tcss"
+
+
+async def test_session_start_prompt_is_ready_for_first_request():
+    action = HookAction(HookActionType.PROMPT, prompt="startup reminder")
+    engine = HookEngine(
+        HookSnapshot((hook_definition("startup", HookEvent.SESSION_START, action),))
+    )
+    client = FakeClient(responses=[complete_response("完成")])
+    config = AppConfig([provider_config(client.name, client.model)])
+    app = DragonCodeApp(
+        config,
+        client_factory=lambda _config: client,
+        hook_engine=engine,
+    )
+
+    async with app.run_test(size=(90, 30)) as pilot:
+        await wait_until_idle(app, pilot)
+        app.query_one("#message-input", MessageInput).load_text("第一条")
+        await pilot.press("enter")
+        await wait_until_idle(app, pilot)
+
+        assert "startup reminder" in client.requests[0].reminder
+
+
+async def test_user_prompt_hook_rejection_restores_input():
+    action = HookAction(HookActionType.SHELL, command="unused")
+    engine = HookEngine(
+        HookSnapshot((hook_definition("block-input", HookEvent.USER_PROMPT_SUBMIT, action),))
+    )
+    engine.executor = BlockingHookExecutor()
+    client = FakeClient()
+    app = DragonCodeApp(
+        AppConfig([provider_config()]),
+        client_factory=lambda _config: client,
+        hook_engine=engine,
+    )
+
+    async with app.run_test(size=(90, 30)) as pilot:
+        await wait_until_idle(app, pilot)
+        input_widget = app.query_one("#message-input", MessageInput)
+        input_widget.load_text("被阻止的输入")
+        await pilot.press("enter")
+        await wait_until_idle(app, pilot)
+
+        assert input_widget.text == "被阻止的输入"
+        assert client.requests == []
+        assert app.agent is not None
+        assert app.agent.conversation.get_messages() == []
+        text = "\n".join(line.text for line in app.query_one(RichLog).lines)
+        assert "输入被 Hook 拒绝" in text
+
+
+async def test_hooks_command_hides_action_body():
+    action = HookAction(HookActionType.SHELL, command="echo VERY_SECRET_VALUE")
+    engine = HookEngine(HookSnapshot((hook_definition("safe-list", HookEvent.STOP, action),)))
+    app = DragonCodeApp(
+        AppConfig([provider_config()]),
+        client_factory=lambda _config: FakeClient(),
+        hook_engine=engine,
+    )
+
+    async with app.run_test(size=(90, 30)) as pilot:
+        await wait_until_idle(app, pilot)
+        app.query_one("#message-input", MessageInput).load_text("/hooks")
+        await pilot.press("enter")
+        await pilot.pause()
+
+        text = "\n".join(line.text for line in app.query_one(RichLog).lines)
+        assert "safe-list" in text
+        assert "VERY_SECRET_VALUE" not in text
+
+
+async def test_session_hooks_cover_start_clear_end_and_resume(tmp_path):
+    manager = SessionManager(tmp_path)
+    saved = manager.open_new("fake-model")
+    saved.conversation.commit_messages(
+        [ChatMessage("user", "saved"), ChatMessage("assistant", "ok")]
+    )
+    saved_id = saved.session_id
+    saved.writer.close()
+
+    action = HookAction(HookActionType.SUBAGENT, task="record")
+    hooks = tuple(
+        hook_definition(f"watch-{event.value}", event, action)
+        for event in (HookEvent.SESSION_START, HookEvent.SESSION_END, HookEvent.SESSION_RESUME)
+    )
+    engine = HookEngine(HookSnapshot(hooks))
+    recorder = RecordingHookExecutor()
+    engine.executor = recorder
+    app = DragonCodeApp(
+        AppConfig([provider_config()]),
+        session_manager=manager,
+        client_factory=lambda _config: FakeClient(),
+        hook_engine=engine,
+    )
+
+    async with app.run_test(size=(90, 30)) as pilot:
+        await wait_until_idle(app, pilot)
+        assert recorder.events == [HookEvent.SESSION_START]
+
+        app.clear_session()
+        await wait_until_idle(app, pilot)
+        assert recorder.events[-2:] == [HookEvent.SESSION_END, HookEvent.SESSION_START]
+
+        app.session_state = SessionState.RESUMING
+        app.query_one("#message-input", MessageInput).disabled = True
+        await app._restore_session(saved_id)
+        await pilot.pause()
+        assert recorder.events[-2:] == [HookEvent.SESSION_END, HookEvent.SESSION_RESUME]
 
 
 def test_tool_line_and_result_summary_are_short():

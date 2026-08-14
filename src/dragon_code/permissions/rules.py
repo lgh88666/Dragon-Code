@@ -1,6 +1,5 @@
 """权限规则解析、匹配、三级加载和永久保存。"""
 
-import os
 import re
 import tempfile
 from pathlib import Path
@@ -8,6 +7,7 @@ from typing import Any
 
 import yaml
 
+from dragon_code.matching import MatcherKind, compile_matcher, match_value
 from dragon_code.models import ToolCall
 from dragon_code.permissions.models import (
     PermissionDecision,
@@ -125,31 +125,6 @@ def make_exact_rule(call: ToolCall, project_root: Path) -> str:
     return f"{call.name}({_escape_exact(value)})"
 
 
-def _pattern_to_regex(pattern: str, *, path_mode: bool) -> re.Pattern[str]:
-    """把简单 glob 转换为完整匹配的正则表达式。"""
-
-    parts = ["^"]
-    index = 0
-    while index < len(pattern):
-        character = pattern[index]
-        if character == "\\" and index + 1 < len(pattern):
-            index += 1
-            parts.append(re.escape(pattern[index]))
-        elif character == "*":
-            if index + 1 < len(pattern) and pattern[index + 1] == "*":
-                index += 1
-                parts.append(".*")
-            else:
-                parts.append("[^/]*" if path_mode else ".*")
-        elif character == "?":
-            parts.append("[^/]" if path_mode else ".")
-        else:
-            parts.append(re.escape(character))
-        index += 1
-    parts.append("$")
-    return re.compile("".join(parts), re.IGNORECASE if os.name == "nt" and path_mode else 0)
-
-
 def _match_value(call: ToolCall, project_root: Path) -> tuple[str, bool] | None:
     if call.arguments is None:
         return None
@@ -186,11 +161,12 @@ def rule_matches(rule: PermissionRule, call: ToolCall, project_root: Path) -> bo
     if rule.pattern is None:
         return True
 
-    match_value = _match_value(call, project_root)
-    if match_value is None:
+    target = _match_value(call, project_root)
+    if target is None:
         return False
-    value, path_mode = match_value
-    return _pattern_to_regex(rule.pattern, path_mode=path_mode).fullmatch(value) is not None
+    value, path_mode = target
+    matcher = compile_matcher(MatcherKind.GLOB, rule.pattern)
+    return match_value(matcher, value, path_mode=path_mode)
 
 
 def _mode(value: Any) -> PermissionMode | None:
