@@ -38,6 +38,13 @@ class HookEngine:
         self.session_id = session_id
         self._executed_once.clear()
 
+    def new_session(self, session_id: str) -> HookEngine:
+        """共享 Hook 定义快照，隔离提醒、only-once 和后台任务。"""
+
+        engine = HookEngine(self.snapshot)
+        engine.begin_session(session_id)
+        return engine
+
     async def trigger(self, context: HookContext) -> HookOutcome:
         outcome = HookOutcome()
         for hook in self.snapshot.hooks:

@@ -91,6 +91,18 @@ def test_mcp_session_allow_applies_until_new_engine(tmp_path):
     )
 
 
+def test_new_session_shares_rules_but_not_temporary_allow(tmp_path):
+    permission = engine(tmp_path)
+    permission.allow_for_session("mcp__local__echo")
+
+    child = permission.new_session()
+
+    assert child.session_allowed_tools == set()
+    assert child.rule_store is permission.rule_store
+    assert child.blacklist is permission.blacklist
+    assert child.sandbox is permission.sandbox
+
+
 def test_blacklist_cannot_be_bypassed(tmp_path):
     from dragon_code.tools.bash import BashTool
 

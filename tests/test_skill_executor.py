@@ -15,6 +15,10 @@ from dragon_code.permissions.engine import PermissionEngine
 from dragon_code.permissions.rules import RuleStore
 from dragon_code.session import Conversation
 from dragon_code.skills import SkillExecutor, SkillLoader, SkillManager, select_fork_history
+from dragon_code.subagents.catalog import AgentCatalog
+from dragon_code.subagents.host import SubAgentHost
+from dragon_code.subagents.manager import BackgroundTaskManager
+from dragon_code.subagents.models import TaskStatus
 from dragon_code.tools.registry import ToolRegistry
 
 
@@ -70,7 +74,25 @@ def make_environment(tmp_path: Path, skill_name="review", **skill_options):
         created.append(client)
         return client
 
-    return manager, main_agent, factory, created
+    task_manager = BackgroundTaskManager()
+    host = SubAgentHost(AgentCatalog(()), task_manager, factory)
+    host.bind_parent(main_agent)
+    return manager, main_agent, factory, created, task_manager, host
+
+
+async def wait_terminal(task_manager: BackgroundTaskManager, task_id: str):
+    for _ in range(200):
+        snapshot = task_manager.get(task_id)
+        if snapshot is not None and snapshot.status in {
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+        }:
+            return snapshot
+        import asyncio
+
+        await asyncio.sleep(0.001)
+    raise AssertionError("Skill 后台任务没有结束")
 
 
 def test_select_fork_history_full_recent_none_and_copy():
@@ -96,42 +118,46 @@ def test_select_fork_history_full_recent_none_and_copy():
     assert messages[6].content == "u2"
 
 
-async def test_fork_events_and_summary_only_return_to_main_history(tmp_path: Path):
-    manager, main_agent, factory, created = make_environment(tmp_path)
-    executor = SkillExecutor(manager, main_agent, factory)
+async def test_fork_events_and_summary_return_as_background_notification(tmp_path: Path):
+    manager, main_agent, factory, created, task_manager, host = make_environment(tmp_path)
+    executor = SkillExecutor(manager, main_agent, factory, host)
 
     events = [event async for event in executor.run_explicit("review", "检查 ch11")]
 
     assert events[0].type == "skill_start"
-    assert any(event.type == "text" and event.skill_name == "review" for event in events)
     assert events[-2].type == "skill_end"
     assert events[-1].type == "completed"
-    history = main_agent.conversation.get_messages()
-    assert [(item.role, item.content) for item in history] == [
-        ("user", "/review 检查 ch11"),
-        ("assistant", "子任务摘要"),
-    ]
-    assert created[0].model == "main-model"
+    task_id = events[-1].text.rsplit("：", 1)[-1]
+    snapshot = await wait_terminal(task_manager, task_id)
+    assert snapshot.result == "主回复"
+    assert main_agent.conversation.get_messages() == []
+    assert created == []
+    await task_manager.close()
+    await host.close()
 
 
 async def test_fork_model_only_overrides_model_name(tmp_path: Path):
-    manager, main_agent, factory, created = make_environment(
+    manager, main_agent, factory, created, task_manager, host = make_environment(
         tmp_path,
         skill_name="other",
         model="child-model",
     )
-    executor = SkillExecutor(manager, main_agent, factory)
+    executor = SkillExecutor(manager, main_agent, factory, host)
 
-    _events = [event async for event in executor.run_explicit("other")]
+    events = [event async for event in executor.run_explicit("other")]
+    task_id = events[-1].text.rsplit("：", 1)[-1]
+    await wait_terminal(task_manager, task_id)
 
     child_config = created[0].config
     assert child_config.model == "child-model"
     assert child_config.protocol == main_agent.client.config.protocol
     assert child_config.api_key == main_agent.client.config.api_key
+    await task_manager.close()
+    await host.close()
 
 
 async def test_inline_uses_main_agent_and_current_model(tmp_path: Path):
-    manager, main_agent, factory, created = make_environment(
+    manager, main_agent, factory, created, _task_manager, _host = make_environment(
         tmp_path,
         skill_name="test",
         mode="inline",

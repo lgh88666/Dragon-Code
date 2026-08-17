@@ -26,6 +26,8 @@ class Tool:
     destructive = False
     is_concurrency_safe = True
     is_system_tool = False
+    # 这类工具只允许主 Agent 真正执行；Fork 可保留 Schema 但会在执行前被拒绝。
+    main_agent_only = False
     # Skill 自定义工具可声明需要黑名单或路径沙箱检查的参数名。
     permission_command_arguments: tuple[str, ...] = ()
     permission_path_arguments: tuple[tuple[str, str], ...] = ()

@@ -12,6 +12,10 @@ from dragon_code.mcp import McpManager, load_mcp_config
 from dragon_code.memory import MemoryManager
 from dragon_code.sessions import SessionManager
 from dragon_code.skills import SkillLoader, SkillManager
+from dragon_code.subagents.catalog import (
+    AgentDefinitionLoader,
+    BuiltinAgentDefinitionError,
+)
 from dragon_code.tools import create_default_registry
 from dragon_code.tui import DragonCodeApp
 
@@ -53,6 +57,7 @@ async def _run_app(config) -> None:
     manager = McpManager(mcp_config)
     hook_snapshot = HookLoader(workdir).load()
     hook_engine = HookEngine(hook_snapshot)
+    app = None
     for issue in hook_snapshot.issues:
         print(f"Hook 警告：{issue.message}", file=sys.stderr)
 
@@ -82,6 +87,14 @@ async def _run_app(config) -> None:
         for issue in skill_manager.issues():
             print(f"Skill 警告：{issue.message}", file=sys.stderr)
 
+        try:
+            agent_catalog = AgentDefinitionLoader(workdir).load()
+        except BuiltinAgentDefinitionError as error:
+            print(f"SubAgent 配置错误：{error}", file=sys.stderr)
+            raise SystemExit(1) from None
+        for issue in agent_catalog.issues():
+            print(f"SubAgent 警告：{issue.message}", file=sys.stderr)
+
         app = DragonCodeApp(
             config,
             registry,
@@ -90,9 +103,14 @@ async def _run_app(config) -> None:
             custom_instructions=custom_instructions,
             skill_manager=skill_manager,
             hook_engine=hook_engine,
+            agent_catalog=agent_catalog,
         )
         await app.run_async()
     finally:
+        if app is not None:
+            close_subagents = getattr(app, "close_subagents", None)
+            if close_subagents is not None:
+                await close_subagents()
         await hook_engine.close()
         session_manager.close()
         await memory_manager.close()

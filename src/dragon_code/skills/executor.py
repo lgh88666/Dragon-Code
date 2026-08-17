@@ -1,16 +1,20 @@
 """编排 inline 与 fork 两种 Skill 执行模式。"""
 
+from __future__ import annotations
+
 import asyncio
 import copy
 from collections.abc import Callable
-from dataclasses import replace
+from typing import TYPE_CHECKING
 
 from dragon_code.agent import Agent
 from dragon_code.clients.base import LLMClient
-from dragon_code.context.manager import ContextManager
-from dragon_code.models import AgentEvent, ChatMessage, ProviderConfig
-from dragon_code.session import Conversation
+from dragon_code.models import AgentEvent, ChatMessage, ProviderConfig, TokenUsage
 from dragon_code.skills.manager import SkillManager
+from dragon_code.subagents.models import SubAgentKind, SubAgentLaunchRequest
+
+if TYPE_CHECKING:
+    from dragon_code.subagents.host import SubAgentHost
 
 
 def select_fork_history(messages: list[ChatMessage], context: str) -> list[ChatMessage]:
@@ -42,10 +46,12 @@ class SkillExecutor:
         manager: SkillManager,
         main_agent: Agent,
         client_factory: Callable[[ProviderConfig], LLMClient],
+        subagent_host: SubAgentHost | None = None,
     ) -> None:
         self.manager = manager
         self.main_agent = main_agent
         self.client_factory = client_factory
+        self.subagent_host = subagent_host
         self.child_agent: Agent | None = None
 
     def request_cancel(self) -> None:
@@ -84,83 +90,47 @@ class SkillExecutor:
             yield event
 
     async def _run_fork(self, skill, arguments: str):
-        history = select_fork_history(
-            self.main_agent.conversation.get_messages(),
-            skill.context,
-        )
-        conversation = Conversation(history)
-        child_runtime = self.manager.create_runtime()
-        child_runtime.activate(skill, arguments)
-
-        config = self.main_agent.client.config
-        if skill.model:
-            config = replace(config, model=skill.model)
-        try:
-            client = self.client_factory(config)
-        except Exception:
+        if self.subagent_host is None:
             yield AgentEvent(
                 type="error",
-                error=ValueError(f"无法为 Skill {skill.name} 创建模型客户端。"),
+                error=ValueError("当前没有可用的 SubAgentHost。"),
                 skill_name=skill.name,
             )
             return
-
-        context_manager = ContextManager(
-            self.main_agent.working_dir,
-            summary_client=self.main_agent.context_manager.summary_client,
-            context_window=config.context_window,
-        )
-        child = Agent(
-            client,
-            conversation,
-            self.main_agent.registry,
-            self.main_agent.working_dir,
-            self.main_agent.version,
-            max_iterations=self.main_agent.max_iterations,
-            unknown_tool_limit=self.main_agent.unknown_tool_limit,
-            permission_engine=self.main_agent.permission_engine,
-            approval_controller=self.main_agent.approval_controller,
-            permission_mode=self.main_agent.mode,
-            context_manager=context_manager,
-            custom_instructions=self.main_agent.custom_instructions,
-            skill_manager=self.manager,
-            skill_runtime=child_runtime,
-        )
-        self.child_agent = child
-        summary = ""
         task = f"请执行 {skill.name} Skill。"
         if arguments.strip():
             task += f"\n用户补充要求：{arguments}"
         try:
-            async for event in child.run(task):
-                event.skill_name = skill.name
-                if event.type == "completed":
-                    summary = event.text
-                    continue
-                yield event
+            outcome = await self.subagent_host.launch(
+                SubAgentLaunchRequest(
+                    prompt=task,
+                    description=f"执行 {skill.name} Skill",
+                    model_override=skill.model or "",
+                    kind=SubAgentKind.SKILL_FORK,
+                    skill_name=skill.name,
+                    skill_arguments=arguments,
+                    skill_context=skill.context,
+                    skill_allowed_tools=skill.allowed_tools,
+                    skill_system_prompt=skill.prompt_body,
+                )
+            )
         except asyncio.CancelledError:
-            child.request_cancel()
             raise
-        finally:
-            self.child_agent = None
-
-        if not summary:
+        except Exception:
+            yield AgentEvent(
+                type="error",
+                error=ValueError(f"无法启动 Skill {skill.name} 的后台任务。"),
+                skill_name=skill.name,
+            )
             return
-        trigger = f"/{skill.name}" + (f" {arguments}" if arguments else "")
-        self.main_agent.conversation.commit_messages(
-            [
-                ChatMessage(role="user", content=trigger),
-                ChatMessage(role="assistant", content=summary),
-            ]
-        )
         yield AgentEvent(
             type="skill_end",
-            text=f"Skill {skill.name} 已完成。",
+            text=f"Skill {skill.name} 已转为后台任务 {outcome.task_id}。",
             skill_name=skill.name,
         )
         yield AgentEvent(
             type="completed",
-            text=summary,
-            usage=child.task_usage,
+            text=f"后台任务已启动：{outcome.task_id}",
+            usage=TokenUsage(0, 0),
             skill_name=skill.name,
         )

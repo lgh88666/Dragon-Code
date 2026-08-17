@@ -21,6 +21,7 @@ from dragon_code.permissions.engine import PermissionEngine
 from dragon_code.permissions.rules import RuleStore
 from dragon_code.session import Conversation
 from dragon_code.skills import SkillDefinition, SkillRuntime
+from dragon_code.subagents.models import QuerySource
 from dragon_code.tools.base import Tool
 from dragon_code.tools.registry import ToolRegistry, create_default_registry
 
@@ -61,6 +62,12 @@ class DemoTool(Tool):
         if self.fail:
             raise RuntimeError("测试工具主动失败")
         return self._success(call, self.result_content or f"result-{call.id}")
+
+
+class MainAgentOnlyTool(DemoTool):
+    """测试用的主 Agent 专用工具。"""
+
+    main_agent_only = True
 
 
 class SequenceClient(LLMClient):
@@ -542,6 +549,77 @@ async def test_blacklist_denial_returns_result_without_execution(tmp_path):
     assert denial.error_code == "permission_denied"
     assert denial.metadata["permission_source"] == "blacklist"
     assert events[-1].type == "completed"
+
+
+async def test_subagent_source_cannot_call_main_agent_only_tool(tmp_path):
+    tool = MainAgentOnlyTool(name="Agent")
+    call = ToolCall("nested", "Agent", {})
+    client = SequenceClient([response(calls=[call]), response("已停止嵌套")])
+    agent = make_agent(
+        client,
+        registry=registry_with(tool),
+        working_dir=tmp_path,
+        query_source=QuerySource.DEFINED_SUBAGENT,
+    )
+
+    events = await collect(agent)
+
+    denial = next(event.tool_result for event in events if event.type == "tool_end")
+    assert denial.error_code == "nested_agent_denied"
+    assert tool.calls == []
+    assert events[-1].type == "completed"
+
+
+async def test_fork_tag_blocks_nested_tool_when_source_marker_is_lost(tmp_path):
+    tool = MainAgentOnlyTool(name="Agent")
+    call = ToolCall("nested", "Agent", {})
+    client = SequenceClient([response(calls=[call]), response("已停止嵌套")])
+    conversation = Conversation(
+        [ChatMessage("user", "<fork-boilerplate>只完成子任务</fork-boilerplate>")]
+    )
+    agent = make_agent(
+        client,
+        conversation=conversation,
+        registry=registry_with(tool),
+        working_dir=tmp_path,
+    )
+
+    events = await collect(agent)
+
+    denial = next(event.tool_result for event in events if event.type == "tool_end")
+    assert denial.error_code == "nested_agent_denied"
+    assert tool.calls == []
+
+
+async def test_runtime_task_notification_is_used_once_without_entering_history(tmp_path):
+    class ReminderSource:
+        def __init__(self):
+            self.reminders = ["<task-notification>后台任务完成</task-notification>"]
+
+        def take_reminders(self):
+            current = list(self.reminders)
+            self.reminders.clear()
+            return current
+
+    client = SequenceClient([response("第一轮"), response("第二轮")])
+    conversation = Conversation()
+    source = ReminderSource()
+    agent = make_agent(
+        client,
+        conversation=conversation,
+        working_dir=tmp_path,
+        runtime_reminder_source=source,
+    )
+
+    await collect(agent, "开始")
+    await collect(agent, "继续")
+
+    first_reminder = client.requests[0].reminder or ""
+    second_reminder = client.requests[1].reminder or ""
+    history_text = "\n".join(message.content for message in conversation.get_messages())
+    assert "后台任务完成" in first_reminder
+    assert "后台任务完成" not in second_reminder
+    assert "后台任务完成" not in history_text
 
 
 async def test_write_asks_and_allow_once_executes(tmp_path):

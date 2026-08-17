@@ -89,6 +89,12 @@ Screen {
     margin: 0 2;
 }
 
+#task-status {
+    width: auto;
+    margin: 0 2;
+    color: $warning;
+}
+
 #command-hint {
     width: auto;
     margin: 0 2;

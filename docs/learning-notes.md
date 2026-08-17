@@ -741,6 +741,43 @@ MessageInput 提交
 
 > 我把 Hook 设计成事件驱动的生命周期扩展层。配置先经过逐条校验和稳定合并，运行时由统一上下文与条件引擎筛选，再交给受超时保护的动作执行器。前置 Hook 可以在副作用发生前拒绝，普通 Hook 的失败只产生可观察结果而不破坏 Agent Loop；异步任务由引擎集中持有并在退出时连同子进程组清理。
 
+## ch13：SubAgent 子任务分发
+
+### 核心调用链
+
+```text
+主模型调用 Agent 工具
+  → SubAgentHost 选择定义式或 Fork
+  → 创建隔离 Session 与 child Agent
+  → BackgroundTaskManager 排队并限制最多三项并发
+  → child Agent 复用原 Agent.run() 跑到自然完成
+  → 结果进入 TaskGet / SendMessage，并生成一次性 task-notification
+  → 用户下一次请求时主 Agent 才收到通知
+```
+
+### 值得记住的设计
+
+1. **定义式和 Fork 共用一个入口**：传角色名走空白历史，不传角色名走父历史 Fork，因此主模型
+   始终只看到一套稳定的 Agent 工具 Schema。
+2. **Fork 合法性靠配对**：父 assistant 可能正在调用 Agent 工具，复制历史时要给悬空 ToolCall
+   补 placeholder ToolResult，再追加子任务 user 消息，否则 Provider 可能返回 400。
+3. **隔离运行状态，共享基础设施**：消息、上下文、临时权限、Token 和 Hook 会话状态不能串线；
+   文件系统、工具实现、持久规则和 LLMClient 工厂可以共享。
+4. **Task 是运行记录，不是 ToolCall 套壳**：ToolCall 只是一次模型请求；Task 还要管理排队、
+   running、后台、取消、最终结果、用量和续派。
+5. **两层阻止递归委派**：正常依赖 QuerySource；如果压缩丢失来源标记，再扫描
+   `<fork-boilerplate>` 兜底，避免 SubAgent 无限创建 SubAgent。
+6. **后台完成不自动唤醒主模型**：Manager 只保存一次性通知，等用户下一次输入时注入请求，
+   不写持久历史，也不会无缘无故消耗一次模型调用。
+7. **共享工作区不是 Worktree**：多个子 Agent 能同时工作，不等于文件隔离；可能写文件时必须
+   提醒冲突，真正的目录隔离留给 ch14。
+
+### 面试表达
+
+> 我用统一 Agent 工具承载定义式和 Fork 式委派。Host 负责构造隔离运行环境，Manager 负责三
+> 并发 FIFO、前后台、取消和结果通知，子 Agent 继续复用已有 ReAct Loop。Fork 会修复工具调用
+> 配对并继承稳定提示前缀以利用缓存，同时通过来源标记和历史标签阻止递归委派。
+
 ## 每章源码回顾模板
 
 ### chXX：[模块名称]

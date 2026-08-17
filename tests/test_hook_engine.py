@@ -29,6 +29,20 @@ def context():
     return HookContext(HookEvent.STOP, "s1", Path.cwd(), "default")
 
 
+def test_new_session_shares_snapshot_but_isolates_reminders():
+    snapshot = HookSnapshot()
+    parent = HookEngine(snapshot)
+    parent.begin_session("parent")
+    parent._pending_reminders.append("parent reminder")
+
+    child = parent.new_session("child")
+
+    assert child.snapshot is parent.snapshot
+    assert child.session_id == "child"
+    assert child.take_reminders() == []
+    assert parent.take_reminders() == ["parent reminder"]
+
+
 async def test_engine_runs_in_order_and_prompt_is_consumed_once():
     first = hook("one", HookAction(HookActionType.PROMPT, prompt="one"))
     second = hook("two", HookAction(HookActionType.SUBAGENT, task="two"))

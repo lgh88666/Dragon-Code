@@ -317,16 +317,29 @@ async def test_review_uses_read_only_tools_and_keeps_mode(tmp_path: Path):
 
         app.screen.dismiss("demo.py")
         await wait_until_idle(app, pilot)
+        for _ in range(30):
+            if client.requests:
+                break
+            await pilot.pause(0.02)
 
         assert [tool.name for tool in client.requests[0].tools] == [
             "Read",
             "Glob",
             "Grep",
             "LoadSkill",
+            "Agent",
+            "TaskList",
+            "TaskGet",
+            "TaskStop",
+            "SendMessage",
         ]
         assert app.agent.mode is PermissionMode.ACCEPT_EDITS
-        assert app.agent.conversation.get_messages()[0].role == "user"
-        assert "demo.py" in app.agent.conversation.get_messages()[0].content
+        # review 是 fork Skill：任务进入独立历史，不污染主会话。
+        assert app.agent.conversation.get_messages() == []
+        assert app.task_manager is not None
+        tasks = app.task_manager.list()
+        assert len(tasks) == 1
+        assert tasks[0].description == "执行 review Skill"
 
 
 async def test_session_command_confirms_before_deleting(tmp_path: Path):
@@ -741,6 +754,11 @@ async def test_plan_mode_and_do_command():
             "Glob",
             "Grep",
             "LoadSkill",
+            "Agent",
+            "TaskList",
+            "TaskGet",
+            "TaskStop",
+            "SendMessage",
         ]
 
         input_widget.load_text("/do")
@@ -749,8 +767,8 @@ async def test_plan_mode_and_do_command():
 
         assert app.agent.mode == "default"
         assert client.requests[1].messages[-1].content == DO_PLAN_PROMPT
-        assert len(client.requests[1].tools) == 7
-        assert client.requests[1].tools[-1].name == "LoadSkill"
+        assert len(client.requests[1].tools) == 12
+        assert client.requests[1].tools[-1].name == "SendMessage"
         assert "Default" in str(app.query_one("#ready", Static).render())
 
 

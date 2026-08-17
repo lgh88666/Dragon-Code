@@ -67,6 +67,15 @@ class ToolRegistry:
                 registry.register(tool)
         return registry
 
+    def filtered(self, predicate) -> "ToolRegistry":
+        """按谓词保留工具，同时维持原注册顺序和工具实例。"""
+
+        registry = ToolRegistry()
+        for tool in self._tools.values():
+            if predicate(tool):
+                registry.register(tool)
+        return registry
+
     async def execute(self, call: ToolCall) -> ToolResult:
         tool = self.get(call.name)
         if tool is None:

@@ -15,11 +15,11 @@
 
 ## 当前状态
 
-- 已完成：ch02–ch12。
-- 最近完成模块：ch12 Hook 生命周期自动化系统。
+- 已完成：ch02–ch13。
+- 最近完成模块：ch13 SubAgent 子任务分发。
 - ch07 实现提交：`9b0d901 feat: add MCP client integration`。
 - ch08 实现提交：`97d3cd7 feat: add ch08 context management`。
-- ch02–ch11 已有本地提交；本次将 ch09–ch12 一并推送到 GitHub `master`。
+- ch02–ch12 已推送到 GitHub `master`；ch13 完成后创建本地提交，等待用户明确要求再推送。
 - 下一开发章节开始前，继续执行理论学习与四文档审批硬门槛。
 
 ## 已有能力
@@ -119,6 +119,23 @@
 - `/hooks` 仅展示名称、事件、动作类型、来源与控制标记，不泄露命令正文或请求头。
 - tmux 已实测写后动作、写前拦截、输入恢复和长耗时 Hook 退出清理。
 
+### ch13：SubAgent 子任务分发
+
+- 主 Agent 新增稳定的 `Agent`、`TaskList`、`TaskGet`、`TaskStop`、`SendMessage` 五个工具。
+- 定义式子 Agent 从空白历史和预定义角色启动；内置 `explore`、`plan`、`verify` 默认使用
+  `deepseek-v4-flash`。
+- Fork 子 Agent 深拷贝父历史，补齐悬空工具结果并继承父模型、系统提示和工具前缀，强制后台。
+- BackgroundTaskManager 提供三并发 FIFO、120 秒自动转后台、手动转后台、取消、状态查询、
+  一次性完成通知和安全结果截断。
+- 子 Agent 复用现有 `Agent.run()`，但隔离 Conversation、上下文、临时权限、Hook 运行状态、
+  SkillRuntime 和 Token；共享 LLM/文件工具、持久规则和 Hook 定义快照。
+- QuerySource 与 Fork 标记双层禁止嵌套委派；子 Agent 权限 Ask 变成结构化拒绝，不弹 TUI 框。
+- fork Skill 已迁移到统一 Host/Manager；本章仍共享工作目录，不提供 Worktree 隔离。
+- 自动化证据：`525 passed, 2 skipped`，Ruff 与 build 通过。
+- tmux：定义式探索、Fork、TaskGet、SendMessage 续派和 fork Skill 主链路通过；完整并发组合与
+  真实权限调整仍在 checklist 中保留为未实测项。
+- 完整证据见 `specs/ch13-subagent/acceptance-report.md`。
+
 ## 当前核心调用链
 
 ```text
@@ -137,6 +154,10 @@ Agent 构造 LLMRequest（系统提示、环境、历史、工具定义）
 AnthropicClient / OpenAIClient 流式返回统一事件
   ↓
 Agent 判断是否存在 ToolCall
+  ↓
+模型可调用 Agent 工具，把定义式或 Fork 子任务交给 SubAgentHost
+  ↓
+BackgroundTaskManager 管理并发、队列、前后台、取消和一次性完成通知
   ↓
 PermissionEngine 检查黑名单、沙箱、规则、模式和用户审批
   ↓
@@ -340,14 +361,27 @@ uv run python -m dragon_code
 
 即使原聊天没有同步，新 Agent 也应从仓库恢复长期规则和当前状态。
 
+## 全部章节完成后的待优化事项
+
+### Skill 激活状态缺少自动退出
+
+- **当前现状**：inline Skill 一旦通过 Slash Command 或 `LoadSkill` 激活，就会保留在
+  `SkillRuntime` 中。此后每次模型请求都会继续注入该 Skill 的完整 SOP reminder，直到
+  用户执行 `/clear`、新建或恢复会话，或者重启 Dragon Code。
+- **主要影响**：任务已经完成后，旧 Skill 仍可能影响模型行为、限制可用工具，并在后续
+  请求中持续消耗动态 reminder token。
+- **待讨论方案**：全部章节开发完成后，统一评估“inline Skill 自然完成后自动退出”、
+  “增加显式停用命令（如 `/skill stop`）”以及“允许用户查看和选择性停用 Active Skills”。
+- **暂不修改原因**：当前行为符合 ch11 已批准的“多个 Skill 持续激活”设计；现在只登记
+  为待处理点，避免在后续章节开发期间临时改变 Skill 生命周期语义。
+
 ## 下一步
 
 推荐顺序：
 
-1. 回顾 ch10 核心源码：输入分流 → Registry → Handler → CommandUI → Textual 交互。
-2. 只精读 `command/registry.py`、`command/dispatch.py`、`command/completion.py` 与 `tui.py` 的接线。
-3. 如需 100% tmux 清单，先创建可丢弃的会话和记忆，再补做清空恢复、会话删除、记忆删除三项。
-4. 学习下一章理论内容，并按 `AGENTS.md` 的四文档流程启动开发。
+1. 回顾 ch13 核心源码：Agent 工具 → Host → Manager → child `Agent.run()` → 通知回流。
+2. 如需补齐 100% tmux 清单，执行四任务并发/排队/Ctrl+B/TaskStop 和真实权限调整场景。
+3. 学习 ch14 Worktree 理论内容，并按 `AGENTS.md` 的四文档流程启动开发。
 
 ## 每章验收后的更新模板
 

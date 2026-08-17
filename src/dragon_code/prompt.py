@@ -105,7 +105,11 @@ def fixed_prompt_modules() -> list[PromptModule]:
             "优先使用 Read、Write、Edit、Glob、Grep 等专用工具，"
             "不要用 Bash 拼凑专用工具已经能完成的操作。"
             "修改已有文件前必须先使用 Read 读取相关内容；精确修改优先使用 Edit。"
-            "只有需要真实执行系统命令时才使用 Bash。",
+            "只有需要真实执行系统命令时才使用 Bash。"
+            "当独立探索或验证会明显污染主上下文时，可以使用 Agent 委派；"
+            "不要为简单的一步操作创建子 Agent。"
+            "子 Agent 共享当前工作目录，没有 Worktree 隔离；"
+            "不要让多个子 Agent 并行修改同一文件。",
         ),
         PromptModule(
             "语气风格",

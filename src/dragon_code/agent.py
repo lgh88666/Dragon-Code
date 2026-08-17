@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 from dragon_code.clients.base import LLMClient, LLMError
 from dragon_code.context.manager import ContextManager
@@ -16,6 +16,7 @@ from dragon_code.models import (
     ChatMessage,
     CompactEvent,
     LLMRequest,
+    SystemPrompt,
     TokenUsage,
     ToolCall,
     ToolResult,
@@ -38,12 +39,21 @@ from dragon_code.prompt import (
 )
 from dragon_code.session import Conversation
 from dragon_code.stream_collector import StreamCollector
+from dragon_code.subagents.fork import is_fork_context
+from dragon_code.subagents.models import QuerySource
 from dragon_code.tool_scheduler import ToolBatch, ToolScheduler
 from dragon_code.tools.registry import ToolRegistry
 
 if TYPE_CHECKING:
     from dragon_code.memory import MemoryManager
     from dragon_code.skills import SkillManager, SkillRuntime
+
+
+class RuntimeReminderSource(Protocol):
+    """提供一次性运行时提醒，不把具体任务管理器耦合进 Agent。"""
+
+    def take_reminders(self) -> list[str]: ...
+
 
 ITERATION_LIMIT_MESSAGE = "已达到 Agent Loop 的 50 次迭代上限。"
 UNKNOWN_TOOL_LIMIT_MESSAGE = "模型连续请求未知工具，Agent Loop 已停止。"
@@ -70,6 +80,10 @@ class Agent:
         skill_manager: SkillManager | None = None,
         skill_runtime: SkillRuntime | None = None,
         hook_engine: HookEngine | None = None,
+        query_source: QuerySource = QuerySource.MAIN,
+        interactive_permissions: bool = True,
+        stable_system_override: str = "",
+        runtime_reminder_source: RuntimeReminderSource | None = None,
     ):
         self.client = client
         self.conversation = conversation
@@ -87,6 +101,12 @@ class Agent:
         self.hook_engine = hook_engine or HookEngine(HookSnapshot())
         self.hook_engine.begin_session(self.context_manager.paths.session_id)
         self.completed_turns = 0
+        self.query_source = query_source
+        self.interactive_permissions = interactive_permissions
+        self.stable_system_override = stable_system_override
+        self.runtime_reminder_source = runtime_reminder_source
+        self.current_system_prompt: SystemPrompt | None = None
+        self.pending_assistant_message: ChatMessage | None = None
 
         # 默认空规则只用于向后兼容和测试；TUI 启动时会注入真实三级配置。
         if permission_engine is None:
@@ -184,7 +204,13 @@ class Agent:
         for event in post_events:
             yield event
 
-    async def run(self, user_text: str, *, read_only: bool = False):
+    async def run(
+        self,
+        user_text: str,
+        *,
+        read_only: bool = False,
+        user_message_in_history: bool = False,
+    ):
         """运行一个完整任务，异步产出界面所需事件。"""
 
         self.cancel_requested = False
@@ -199,6 +225,12 @@ class Agent:
             available_skills=self.skill_manager.summary_text() if self.skill_manager else "",
             memory=self.memory_manager.current_index() if self.memory_manager else "",
         )
+        if self.stable_system_override:
+            system_prompt = SystemPrompt(
+                stable=self.stable_system_override,
+                environment=system_prompt.environment,
+            )
+        self.current_system_prompt = system_prompt
 
         submit_outcome, submit_events = await self._run_hooks(
             HookEvent.USER_PROMPT_SUBMIT,
@@ -216,8 +248,8 @@ class Agent:
             return
 
         user_message = ChatMessage(role="user", content=user_text)
-        turn_messages = [copy.deepcopy(user_message)]
-        user_committed = False
+        turn_messages = [] if user_message_in_history else [copy.deepcopy(user_message)]
+        user_committed = user_message_in_history
         unknown_rounds = 0
 
         for iteration in range(1, self.max_iterations + 1):
@@ -250,6 +282,11 @@ class Agent:
                     active_skills=active_skill_text,
                 ),
                 hook_notification(self.hook_engine.take_reminders()),
+                hook_notification(
+                    self.runtime_reminder_source.take_reminders()
+                    if self.runtime_reminder_source is not None
+                    else []
+                ),
             )
             tool_definitions = active_registry.definitions()
             committed_history = self.conversation.get_messages()
@@ -437,11 +474,15 @@ class Agent:
                 return
 
             raw_results = []
-            async for tool_event in self._execute_tools(assistant_message.tool_calls):
-                if tool_event.tool_result is not None:
-                    raw_results.append(tool_event.tool_result)
-                else:
-                    yield tool_event
+            self.pending_assistant_message = copy.deepcopy(assistant_message)
+            try:
+                async for tool_event in self._execute_tools(assistant_message.tool_calls):
+                    if tool_event.tool_result is not None:
+                        raw_results.append(tool_event.tool_result)
+                    else:
+                        yield tool_event
+            finally:
+                self.pending_assistant_message = None
             results = await self.context_manager.process_tool_results(raw_results)
             if self.context_manager.last_offload_failures:
                 yield AgentEvent(
@@ -581,6 +622,16 @@ class Agent:
             allowed_indexes: list[int] = []
 
             for call_index, call in enumerate(batch.calls):
+                tool = self.scheduler.registry.get(call.name)
+                if tool is not None and tool.main_agent_only and self._nested_tool_denied():
+                    results[call_index] = ToolResult(
+                        call_id=call.id,
+                        tool_name=call.name,
+                        success=False,
+                        error_code="nested_agent_denied",
+                        error_message="子 Agent 不能创建或管理其他子 Agent。",
+                    )
+                    continue
                 hook_outcome, hook_events = await self._run_hooks(
                     HookEvent.PRE_TOOL_USE,
                     {
@@ -603,7 +654,7 @@ class Agent:
 
                 permission = self.permission_engine.check(
                     call,
-                    self.scheduler.registry.get(call.name),
+                    tool,
                     self.mode,
                 )
                 if permission.decision is PermissionDecision.DENY:
@@ -611,6 +662,14 @@ class Agent:
                     continue
 
                 if permission.decision is PermissionDecision.ASK:
+                    if not self.interactive_permissions:
+                        denied = PermissionResult(
+                            PermissionDecision.DENY,
+                            "non_interactive",
+                            "子 Agent 不能发起交互式权限确认，请调整方案。",
+                        )
+                        results[call_index] = self._permission_denied_result(call, denied)
+                        continue
                     _notification, notification_events = await self._run_hooks(
                         HookEvent.NOTIFICATION,
                         {
@@ -762,3 +821,10 @@ class Agent:
             return []
         calls = [call for batch in batches for call in batch.calls]
         return self.scheduler.make_cancelled_results(calls)
+
+    def _nested_tool_denied(self) -> bool:
+        """来源是子 Agent 或历史带 Fork 标记时，拒绝元任务工具。"""
+
+        if self.query_source is not QuerySource.MAIN:
+            return True
+        return is_fork_context(self.conversation.get_messages())

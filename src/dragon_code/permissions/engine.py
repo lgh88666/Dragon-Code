@@ -33,6 +33,16 @@ class PermissionEngine:
         if is_mcp_tool_name(tool_name) or is_skill_tool_name(tool_name):
             self.session_allowed_tools.add(tool_name)
 
+    def new_session(self) -> "PermissionEngine":
+        """共享持久规则和安全组件，但不继承会话级临时允许。"""
+
+        return PermissionEngine(
+            self.project_root,
+            self.rule_store,
+            blacklist=self.blacklist,
+            sandbox=self.sandbox,
+        )
+
     def check(
         self,
         call: ToolCall,
@@ -90,7 +100,9 @@ class PermissionEngine:
 
     @staticmethod
     def _mode_fallback(tool: Tool, mode: PermissionMode) -> PermissionResult:
-        if tool.read_only:
+        if tool.is_system_tool:
+            decision = PermissionDecision.ALLOW
+        elif tool.read_only:
             decision = PermissionDecision.ALLOW
         elif tool.category == "filesystem":
             decision = (

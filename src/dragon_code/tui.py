@@ -67,6 +67,15 @@ from dragon_code.prompt import DO_PLAN_PROMPT, build_system_prompt, render_banne
 from dragon_code.sessions import ActiveSession, SessionInfo, SessionManager
 from dragon_code.skills import SkillExecutor, SkillLoader, SkillManager
 from dragon_code.skills.tools import LoadSkillTool, registry_for_skill_tools
+from dragon_code.subagents.catalog import AgentCatalog, AgentDefinitionLoader
+from dragon_code.subagents.host import SubAgentHost
+from dragon_code.subagents.manager import BackgroundTaskManager
+from dragon_code.subagents.models import SubAgentEvent, TaskStatus
+from dragon_code.subagents.tools import (
+    AgentTool,
+    SendMessageTool,
+    create_subagent_tools,
+)
 from dragon_code.tools import ToolRegistry, create_default_registry
 
 
@@ -387,6 +396,7 @@ class DragonCodeApp(App):
         Binding("enter", "submit_current_input", show=False, priority=True),
         Binding("ctrl+c", "copy_or_quit", show=False, priority=True),
         Binding("escape", "cancel_turn", show=False, priority=True),
+        Binding("ctrl+b", "background_current_subagent", show=False, priority=True),
         Binding("shift+tab", "cycle_permission_mode", show=False, priority=True),
     ]
 
@@ -400,6 +410,7 @@ class DragonCodeApp(App):
         custom_instructions: str = "",
         skill_manager: SkillManager | None = None,
         hook_engine: HookEngine | None = None,
+        agent_catalog: AgentCatalog | None = None,
     ):
         super().__init__()
         self.config = config
@@ -428,6 +439,17 @@ class DragonCodeApp(App):
             skill_manager.reload()
         self.skill_manager = skill_manager
         self.hook_engine = hook_engine or HookEngine(HookSnapshot())
+        self.agent_catalog = (
+            agent_catalog
+            or AgentDefinitionLoader(
+                self.session_manager.project_root,
+                user_home=self.session_manager.project_root / ".dragon-code" / "test-home",
+            ).load()
+        )
+        self.task_manager: BackgroundTaskManager | None = None
+        self.subagent_host: SubAgentHost | None = None
+        self.subagent_tools = []
+        self.subagent_buffers: dict[str, str] = {}
         self.skill_runtime = None
         self.skill_executor: SkillExecutor | None = None
         self.client_factory = client_factory
@@ -456,6 +478,7 @@ class DragonCodeApp(App):
         self.pending_permission_call_id = ""
         self.hook_worker: Worker | None = None
         self.hook_poll_timer: Timer | None = None
+        self.task_poll_timer: Timer | None = None
         self.quitting = False
 
     def compose(self) -> ComposeResult:
@@ -476,11 +499,13 @@ class DragonCodeApp(App):
         with Horizontal(id="statusbar"):
             yield Static("", id="provider-name")
             yield Static("Token 0", id="token-usage")
+            yield Static("", id="task-status")
             yield Static("Tab 补全 · /help", id="command-hint")
             yield Static("", id="model-name")
 
     def on_mount(self) -> None:
         self.hook_poll_timer = self.set_interval(0.2, self._poll_hook_results)
+        self.task_poll_timer = self.set_interval(0.1, self._poll_subagent_events)
         if len(self.config.providers) == 1:
             self._activate_provider(0)
             return
@@ -527,9 +552,20 @@ class DragonCodeApp(App):
             skill_registry = registry_for_skill_tools(self.skill_manager.list_skills())
             system_registry = ToolRegistry()
             system_registry.register(LoadSkillTool(self.skill_manager, self.skill_runtime))
+            self.task_manager = BackgroundTaskManager()
+            subagent_tools = create_subagent_tools(self.agent_catalog, self.task_manager)
+            self.subagent_tools = subagent_tools
+            for tool in subagent_tools:
+                system_registry.register(tool)
             self.registry = self.base_registry.combined(skill_registry, system_registry)
         else:
-            self.registry = self.base_registry
+            self.task_manager = BackgroundTaskManager()
+            system_registry = ToolRegistry()
+            subagent_tools = create_subagent_tools(self.agent_catalog, self.task_manager)
+            self.subagent_tools = subagent_tools
+            for tool in subagent_tools:
+                system_registry.register(tool)
+            self.registry = self.base_registry.combined(system_registry)
         self.agent = Agent(
             self.client,
             self.active_session.conversation,
@@ -549,12 +585,23 @@ class DragonCodeApp(App):
             skill_manager=self.skill_manager,
             skill_runtime=self.skill_runtime,
             hook_engine=self.hook_engine,
+            runtime_reminder_source=self.task_manager,
         )
+        self.subagent_host = SubAgentHost(
+            self.agent_catalog,
+            self.task_manager,
+            self.client_factory,
+        )
+        self.subagent_host.bind_parent(self.agent)
+        for tool in subagent_tools:
+            if isinstance(tool, (AgentTool, SendMessageTool)):
+                tool.bind_host(self.subagent_host)
         if self.skill_manager is not None:
             self.skill_executor = SkillExecutor(
                 self.skill_manager,
                 self.agent,
                 self.client_factory,
+                subagent_host=self.subagent_host,
             )
         # SessionStart Hook 完成前暂不接受首条输入，避免首轮漏掉启动提醒。
         self.session_state = SessionState.COMMAND
@@ -821,6 +868,99 @@ class DragonCodeApp(App):
 
         for execution in self.hook_engine.drain_background_results():
             self._write_hook_execution(execution)
+
+    def _poll_subagent_events(self) -> None:
+        """显示子任务状态；后台内部对话不会写入主 scrollback。"""
+
+        if self.task_manager is None:
+            return
+        for event in self.task_manager.drain_events():
+            self._write_subagent_event(event)
+        self._update_task_status()
+
+    def _write_subagent_event(self, event: SubAgentEvent) -> None:
+        conversation = self.query_one("#conversation", RichLog)
+        label = event.task_name or event.agent_name or event.task_id
+        if event.attached and event.type == "text":
+            current = self.subagent_buffers.get(event.task_id, "") + event.text
+            self.subagent_buffers[event.task_id] = current
+            self.query_one("#streaming", Static).update(f"[{label}] {current}")
+            return
+        if event.attached and event.type == "tool_start" and event.tool_call is not None:
+            self._flush_subagent_buffer(event.task_id, label)
+            conversation.write(
+                Text(f"[{label}] {format_tool_call(event.tool_call)}", style="bold magenta")
+            )
+            return
+        if event.attached and event.type == "tool_end" and event.tool_result is not None:
+            result = format_tool_result(event.tool_result)
+            style = "green" if event.tool_result.success else "bold red"
+            conversation.write(Text(f"[{label}]   └─ {result}", style=style))
+            return
+        if event.attached and event.type == "progress":
+            conversation.write(
+                Text(
+                    f"● Agent {label}：第 {event.iteration}/{event.max_iterations} 轮",
+                    style="dim magenta",
+                )
+            )
+            return
+        if event.type == "queued":
+            conversation.write(Text(f"● Agent {label} 已排队（{event.task_id}）", style="yellow"))
+        elif event.type == "workspace_warning":
+            conversation.write(Text(f"● Agent {label}：{event.text}", style="bold yellow"))
+        elif event.type == "running":
+            mode = "前台" if event.attached else "后台"
+            conversation.write(
+                Text(f"● Agent {label} 开始{mode}运行（{event.task_id}）", style="magenta")
+            )
+        elif event.type in {"manual_background", "timeout_background"}:
+            reason = "用户切换" if event.type == "manual_background" else "运行超过 120 秒"
+            conversation.write(
+                Text(f"● Agent {label} 已转后台：{reason}（{event.task_id}）", style="yellow")
+            )
+        elif event.type in {"completed", "failed", "cancelled"} and event.status in {
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+        }:
+            self._flush_subagent_buffer(event.task_id, label)
+            styles = {
+                TaskStatus.COMPLETED: "bold green",
+                TaskStatus.FAILED: "bold red",
+                TaskStatus.CANCELLED: "bold yellow",
+            }
+            summary = event.text.replace("\n", " ")
+            if len(summary) > 240:
+                summary = summary[:237] + "..."
+            suffix = f"：{summary}" if summary else ""
+            conversation.write(
+                Text(
+                    f"● Agent {label} {event.status.value}（{event.task_id}）{suffix}",
+                    style=styles[event.status],
+                )
+            )
+
+    def _flush_subagent_buffer(self, task_id: str, label: str) -> None:
+        text = self.subagent_buffers.pop(task_id, "")
+        if not text:
+            return
+        self.query_one("#conversation", RichLog).write(
+            Group(Text(f"[{label}]", style="bold magenta"), Markdown(text))
+        )
+        self.query_one("#streaming", Static).update("")
+
+    def _update_task_status(self) -> None:
+        try:
+            widget = self.query_one("#task-status", Static)
+        except Exception:
+            return
+        if self.task_manager is None:
+            widget.update("")
+            return
+        running = self.task_manager.running_count()
+        queued = self.task_manager.queued_count()
+        widget.update(f"Agents {running} running · {queued} queued" if running or queued else "")
 
     def _start_manual_compact(self) -> None:
         """在空闲状态启动一次不进入普通对话的强制压缩。"""
@@ -1252,6 +1392,8 @@ class DragonCodeApp(App):
             skill_registry = registry_for_skill_tools(snapshot.skills)
             system_registry = ToolRegistry()
             system_registry.register(LoadSkillTool(self.skill_manager, self.skill_runtime))
+            for tool in self.subagent_tools:
+                system_registry.register(tool)
             self.registry = self.base_registry.combined(skill_registry, system_registry)
             self.agent.registry = self.registry
             self.agent.plan_registry = self.registry.restricted({"Read", "Glob", "Grep"})
@@ -1325,6 +1467,7 @@ class DragonCodeApp(App):
             )
             old_session = self.active_session
             await self._trigger_lifecycle(HookEvent.SESSION_END, {"reason": "clear"})
+            await self._reset_subagents()
             await self.hook_engine.close()
             self.agent.replace_session(
                 new_session.conversation,
@@ -1377,6 +1520,7 @@ class DragonCodeApp(App):
         try:
             await self._trigger_lifecycle(HookEvent.SESSION_END, {"reason": "exit"})
         finally:
+            await self.close_subagents()
             await self.hook_engine.close()
             self._perform_safe_quit()
 
@@ -1444,6 +1588,32 @@ class DragonCodeApp(App):
             if self.resume_worker is not None:
                 self.resume_worker.cancel()
             self._finish_local_command()
+
+    def action_background_current_subagent(self) -> None:
+        """Ctrl+B 只解除前台等待，底层子 Agent 继续同一次运行。"""
+
+        if self.task_manager is None:
+            return
+        task_id = self.task_manager.move_foreground_to_background()
+        if task_id is None:
+            self.show_message("当前没有可转入后台的前台子 Agent。")
+
+    async def _reset_subagents(self) -> None:
+        if self.task_manager is not None:
+            await self.task_manager.reset_session()
+        if self.subagent_host is not None:
+            await self.subagent_host.reset_sessions()
+        self.subagent_buffers.clear()
+        self._update_task_status()
+
+    async def close_subagents(self) -> None:
+        """供 TUI 正常退出和 CLI finally 幂等清理子任务。"""
+
+        if self.task_manager is not None:
+            await self.task_manager.close()
+        if self.subagent_host is not None:
+            await self.subagent_host.close()
+        self.subagent_buffers.clear()
 
     def action_copy_or_quit(self) -> None:
         """有选中文字时复制，否则沿用 Ctrl+C 安全退出。"""
@@ -1548,6 +1718,7 @@ class DragonCodeApp(App):
 
             old_session = self.active_session
             await self._trigger_lifecycle(HookEvent.SESSION_END, {"reason": "resume"})
+            await self._reset_subagents()
             await self.hook_engine.close()
             self.agent.replace_session(new_session.conversation, context_manager)
             self.active_session = new_session
