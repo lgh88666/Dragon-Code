@@ -16,10 +16,10 @@
 ## 当前状态
 
 - 已完成：ch02–ch13。
-- 最近完成模块：ch13 SubAgent 子任务分发。
+- 最近完成模块：ch13 后的工具与 SubAgent 交互可读性优化。
 - ch07 实现提交：`9b0d901 feat: add MCP client integration`。
 - ch08 实现提交：`97d3cd7 feat: add ch08 context management`。
-- ch02–ch12 已推送到 GitHub `master`；ch13 完成后创建本地提交，等待用户明确要求再推送。
+- ch02–ch12 已推送到 GitHub `master`；ch13 与后续交互优化保留本地提交，等待用户明确要求再推送。
 - 下一开发章节开始前，继续执行理论学习与四文档审批硬门槛。
 
 ## 已有能力
@@ -135,6 +135,18 @@
 - tmux：定义式探索、Fork、TaskGet、SendMessage 续派和 fork Skill 主链路通过；完整并发组合与
   真实权限调整仍在 checklist 中保留为未实测项。
 - 完整证据见 `specs/ch13-subagent/acceptance-report.md`。
+
+### ch13 后：工具交互可读性优化
+
+- 工具运行中只在输入框上方动态区域显示一条 `● 工具名 关键参数`，不再提前污染 scrollback。
+- 工具完成后成功只保留一行 `✓` 摘要；失败使用暗红 `✗` 与下一行短原因。
+- Read、Glob、Grep、Bash 和 SubAgent 系统工具使用语义摘要，不直接展示冗长协议结果。
+- 前台子 Agent 内部工具继续可见并带任务标签；后台子 Agent 内部过程保持隐藏。
+- 普通任务状态隐藏 task ID，只有查询或失败定位时显示；完成摘要限制约 80 个终端显示宽度。
+- 颜色统一为低饱和暖橙、柔和灰和暗红，主对话、命令、Hook 与权限流程不变。
+- 自动化证据：`53` 项 TUI 测试通过，全量 `530 passed, 2 skipped`，Ruff 通过。
+- tmux 证据：真实 Read/Grep/Bash、前台定义式子 Agent、后台 Fork、失败恢复与退出清理通过。
+- 完整证据见 `specs/tool-readability/acceptance-report.md`。
 
 ## 当前核心调用链
 
@@ -286,6 +298,7 @@ ch07 完成时的证据：
 
 ## 学习与回顾状态
 
+- 工具与 SubAgent 可读性优化已经验收；可在下次回顾中对照讲解“动态状态”和“最终 scrollback”分层。
 - ch11 已完成开发与验收；下一步安排一次只讲核心链路的源码回顾。
 - ch10 已补充一份聚焦 Registry、分流、UI Protocol、补全和只读审查的学习笔记；下一步可进行核心源码回顾。
 - `docs/learning-notes.md` 已系统整理 ch02、ch03、聊天历史复制、ch05，并补充 ch09 核心源码回顾入口。

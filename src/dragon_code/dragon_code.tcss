@@ -25,6 +25,14 @@ Screen {
     scrollbar-size: 1 1;
 }
 
+#tool-activity {
+    width: 1fr;
+    height: auto;
+    max-height: 8;
+    margin: 0 2;
+    color: #c2a078;
+}
+
 #streaming {
     width: 1fr;
     height: auto;
@@ -92,7 +100,7 @@ Screen {
 #task-status {
     width: auto;
     margin: 0 2;
-    color: $warning;
+    color: #c2a078;
 }
 
 #command-hint {

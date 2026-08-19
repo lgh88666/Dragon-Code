@@ -46,6 +46,7 @@ from dragon_code.permissions import ApprovalChoice, PermissionMode, PermissionRe
 from dragon_code.prompt import DO_PLAN_PROMPT
 from dragon_code.session import Conversation
 from dragon_code.sessions import SessionManager
+from dragon_code.subagents.models import SubAgentEvent, TaskStatus
 from dragon_code.tools import create_default_registry
 from dragon_code.tui import (
     CommandHelpScreen,
@@ -677,7 +678,7 @@ async def test_tool_events_render_in_scrollback_in_order():
         conversation = app.query_one("#conversation", RichLog)
         conversation.text_select_all()
         selected = app.screen.get_selected_text() or ""
-        assert selected.index("Read(pyproject.toml)") < selected.index("读取完成")
+        assert selected.index("Read  pyproject.toml") < selected.index("读取完成")
         assert "project" in selected
 
 
@@ -718,10 +719,172 @@ async def test_tool_result_states_have_distinct_labels():
         conversation = app.query_one("#conversation", RichLog)
         conversation.text_select_all()
         selected = app.screen.get_selected_text() or ""
-        assert "└─ 成功" in selected
-        assert "└─ 错误：文件不存在" in selected
-        assert "└─ 已取消：尚未开始" in selected
-        assert "└─ 状态未知：无法确认" in selected
+        assert "✓ Read  读取 1 行" in selected
+        assert "✗ Read" in selected
+        assert "└ 文件不存在" in selected
+        assert "● Bash  已取消 · 尚未开始" in selected
+        assert "✗ Bash" in selected
+        assert "└ 无法确认" in selected
+
+
+def test_tool_result_summaries_hide_protocol_details():
+    bash_result = ToolResult(
+        "bash-1",
+        "Bash",
+        True,
+        content="stdout:\ndone\nstderr:\n\nexit_code: 0",
+        metadata={"stdout": "done\n", "stderr": "", "exit_code": 0},
+    )
+    agent_result = ToolResult(
+        "agent-1",
+        "Agent",
+        True,
+        content='{"background": false, "result": "很长的子任务原文"}',
+    )
+
+    assert format_tool_result(bash_result) == "stdout: done"
+    assert format_tool_result(agent_result) == "子任务已完成"
+
+
+async def test_tool_activity_is_transient_and_success_is_single_line():
+    app = app_with_client(FakeClient())
+    call = ToolCall("read-active", "Read", {"path": "src/dragon.py"})
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        app._start_tool_display("main:read-active", call)
+        await pilot.pause()
+
+        assert list(app.active_tool_displays) == ["main:read-active"]
+        activity = app.query_one("#tool-activity", Static)
+        with app.console.capture() as capture:
+            app.console.print(activity.render()._renderable)
+        assert "● Read  src/dragon.py" in capture.get()
+
+        app._finish_tool_display(
+            "main:read-active",
+            ToolResult("read-active", "Read", True, content="第一行\n第二行"),
+        )
+        await pilot.pause()
+
+        assert app.active_tool_displays == {}
+        conversation = app.query_one("#conversation", RichLog)
+        conversation.text_select_all()
+        selected = app.screen.get_selected_text() or ""
+        assert selected.count("Read") == 1
+        assert "✓ Read  src/dragon.py  读取 2 行" in selected
+
+
+async def test_two_active_tools_keep_order_and_clear_independently():
+    app = app_with_client(FakeClient())
+    first = ToolCall("one", "Read", {"path": "one.py"})
+    second = ToolCall("two", "Grep", {"pattern": "dragon", "path": "src"})
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        app._start_tool_display("main:one", first)
+        app._start_tool_display("main:two", second)
+        await pilot.pause()
+
+        assert list(app.active_tool_displays) == ["main:one", "main:two"]
+        app._finish_tool_display("main:one", ToolResult("one", "Read", True, "内容"))
+        assert list(app.active_tool_displays) == ["main:two"]
+        app._finish_tool_display("main:two", ToolResult("two", "Grep", True, "a.py:1"))
+        assert app.active_tool_displays == {}
+
+
+async def test_subagent_tools_show_only_when_attached():
+    app = app_with_client(FakeClient())
+    foreground_call = ToolCall("front", "Read", {"path": "front.py"})
+    background_call = ToolCall("back", "Read", {"path": "hidden.py"})
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        app._write_subagent_event(
+            SubAgentEvent(
+                "tool_start",
+                "task_front",
+                "reader",
+                "explore",
+                True,
+                tool_call=foreground_call,
+            )
+        )
+        assert "sub:task_front:front" in app.active_tool_displays
+        app._write_subagent_event(
+            SubAgentEvent(
+                "tool_end",
+                "task_front",
+                "reader",
+                "explore",
+                True,
+                tool_result=ToolResult("front", "Read", True, "一行"),
+            )
+        )
+        app._write_subagent_event(
+            SubAgentEvent(
+                "tool_start",
+                "task_back",
+                "background-reader",
+                "explore",
+                False,
+                tool_call=background_call,
+            )
+        )
+        await pilot.pause()
+
+        conversation = app.query_one("#conversation", RichLog)
+        conversation.text_select_all()
+        selected = app.screen.get_selected_text() or ""
+        assert "reader · Read  front.py" in selected
+        assert "hidden.py" not in selected
+        assert all("task_back" not in key for key in app.active_tool_displays)
+
+
+async def test_subagent_status_hides_normal_id_and_failed_shows_id():
+    app = app_with_client(FakeClient())
+    long_summary = "摘要" * 100
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        app._write_subagent_event(
+            SubAgentEvent(
+                "running",
+                "task_normal",
+                "permission-study",
+                "explore",
+                False,
+                status=TaskStatus.RUNNING,
+            )
+        )
+        app._write_subagent_event(
+            SubAgentEvent(
+                "completed",
+                "task_normal",
+                "permission-study",
+                "explore",
+                False,
+                text=long_summary,
+                status=TaskStatus.COMPLETED,
+            )
+        )
+        app._write_subagent_event(
+            SubAgentEvent(
+                "failed",
+                "task_failed",
+                "broken-study",
+                "explore",
+                False,
+                text="模型请求失败",
+                status=TaskStatus.FAILED,
+            )
+        )
+        await pilot.pause()
+
+        conversation = app.query_one("#conversation", RichLog)
+        conversation.text_select_all()
+        selected = app.screen.get_selected_text() or ""
+        assert "task_normal" not in selected
+        assert "✓ Agent  permission-study  已完成" in selected
+        assert "摘要" * 40 not in selected
+        assert "✗ Agent  broken-study  执行失败" in selected
+        assert "task_failed" in selected
 
 
 async def test_plan_mode_and_do_command():
@@ -1289,8 +1452,8 @@ def test_tool_line_and_result_summary_are_short():
     call = ToolCall("1", "Read", {"path": "src/app.py"})
     success = ToolResult("1", "Read", True, content="x" * 500, truncated=True)
     failure = ToolResult("2", "Read", False, error_message="文件不存在")
-    assert format_tool_call(call) == "● Read(src/app.py)"
-    assert len(format_tool_result(success)) < 270
+    assert format_tool_call(call) == "● Read  src/app.py"
+    assert len(format_tool_result(success)) < 120
     assert "已截断" in format_tool_result(success)
     offloaded = ToolResult(
         "3",

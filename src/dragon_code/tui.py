@@ -1,11 +1,12 @@
 """Dragon Code 的 Textual 终端界面。"""
 
 import asyncio
+import json
 import os
 import subprocess
 import time
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 
@@ -78,9 +79,23 @@ from dragon_code.subagents.tools import (
 )
 from dragon_code.tools import ToolRegistry, create_default_registry
 
+# 工具过程使用接近 Claude Code 的低饱和配色，避免抢过最终回答。
+TOOL_ACCENT = "#c2a078"
+TOOL_MUTED = "#8c8c86"
+TOOL_ERROR = "#b86b6b"
 
-def format_tool_call(call: ToolCall) -> str:
-    """生成 Claude Code 风格的单行工具说明。"""
+
+@dataclass(frozen=True)
+class PendingToolDisplay:
+    """一个尚未完成、只显示在动态区域的工具调用。"""
+
+    key: str
+    call: ToolCall
+    agent_label: str = ""
+
+
+def _tool_key_argument(call: ToolCall) -> str:
+    """提取最值得用户看到的关键参数。"""
 
     arguments = call.arguments or {}
     if call.name in {"Read", "Write", "Edit"}:
@@ -90,26 +105,91 @@ def format_tool_call(call: ToolCall) -> str:
     elif call.name == "Glob":
         key = arguments.get("pattern", "")
     elif call.name == "Grep":
-        key = f"{arguments.get('pattern', '')}, {arguments.get('path', '.')}"
+        key = f"{arguments.get('pattern', '')} · {arguments.get('path', '.')}"
+    elif call.name == "Agent":
+        key = arguments.get("name") or arguments.get("description") or arguments.get("role", "")
+    elif call.name in {"TaskGet", "TaskStop"}:
+        key = arguments.get("task_id", "")
+    elif call.name == "SendMessage":
+        key = arguments.get("name", "")
     else:
-        # MCP 参数结构不固定，显示前几个键值即可。
-        key = ", ".join(f"{name}={value}" for name, value in list(arguments.items())[:3])
-    key = str(key).replace("\n", " ")
-    if len(key) > 100:
-        key = key[:97] + "..."
-    return f"● {call.name}({key})"
+        key = " · ".join(f"{name}={value}" for name, value in list(arguments.items())[:3])
+    key = str(key).replace("\n", " ").strip()
+    if len(key) > 92:
+        key = key[:89] + "..."
+    return key
 
 
-def format_tool_result(result: ToolResult) -> str:
+def format_tool_subject(call: ToolCall, *, agent_label: str = "") -> str:
+    """生成无状态符号的紧凑工具主题。"""
+
+    source = f"{agent_label} · " if agent_label else ""
+    key = _tool_key_argument(call)
+    return f"{source}{call.name}  {key}".rstrip()
+
+
+def format_tool_call(call: ToolCall) -> str:
+    """保留给测试和简单调用方的执行中纯文本格式。"""
+
+    return f"● {format_tool_subject(call)}"
+
+
+def _system_tool_summary(result: ToolResult) -> str:
+    """把任务工具 JSON 压缩成用户能快速扫读的摘要。"""
+
+    if result.tool_name not in {"Agent", "TaskList", "TaskGet", "TaskStop", "SendMessage"}:
+        return ""
+    try:
+        data = json.loads(result.content)
+    except (TypeError, ValueError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    if result.tool_name == "TaskList":
+        tasks = data.get("tasks", [])
+        return (
+            f"{len(tasks)} 个任务 · {data.get('running', 0)} running · "
+            f"{data.get('queued', 0)} queued"
+        )
+    if result.tool_name == "TaskGet":
+        detail = data.get("result") or data.get("error") or data.get("status", "")
+        return f"{data.get('task_id', '')} · {detail}".strip(" ·")
+    if result.tool_name == "TaskStop":
+        return f"{data.get('task_id', '')} · {data.get('status', '已停止')}".strip(" ·")
+    if result.tool_name == "SendMessage":
+        return f"新任务已创建 · {data.get('status', 'queued')}"
+    if data.get("background"):
+        return "后台任务已启动"
+    return "子任务已完成"
+
+
+def format_tool_result(result: ToolResult, *, limit: int = 100) -> str:
     """只为 TUI 生成短摘要，完整内容仍只回灌给模型。"""
 
     if result.success:
-        text = result.content or "执行成功"
+        system_summary = _system_tool_summary(result)
+        if system_summary:
+            text = system_summary
+        elif result.tool_name == "Read":
+            lines = result.content.splitlines()
+            text = f"读取 {len(lines)} 行" if lines else "文件为空"
+        elif result.tool_name == "Glob":
+            count = len([line for line in result.content.splitlines() if line.strip()])
+            text = f"找到 {count} 个文件"
+        elif result.tool_name == "Grep":
+            count = len([line for line in result.content.splitlines() if line.strip()])
+            text = f"找到 {count} 处匹配"
+        elif result.tool_name == "Bash":
+            # Bash 的完整结果包含 stdout、stderr 和退出码，直接展示会撑成多行。
+            stdout = str(result.metadata.get("stdout", "")).strip()
+            text = f"stdout: {stdout}" if stdout else "命令执行成功"
+        else:
+            text = result.content or "执行成功"
     else:
         text = result.error_message or "执行失败"
     text = text.replace("\n", " ")
-    if len(text) > 240:
-        text = text[:237] + "..."
+    if len(text) > limit:
+        text = text[: limit - 3] + "..."
     if result.truncated:
         suffix = "完整结果已保存" if result.metadata.get("context_offloaded") else "结果已截断"
         text += f"（{suffix}）"
@@ -450,6 +530,7 @@ class DragonCodeApp(App):
         self.subagent_host: SubAgentHost | None = None
         self.subagent_tools = []
         self.subagent_buffers: dict[str, str] = {}
+        self.active_tool_displays: dict[str, PendingToolDisplay] = {}
         self.skill_runtime = None
         self.skill_executor: SkillExecutor | None = None
         self.client_factory = client_factory
@@ -485,6 +566,7 @@ class DragonCodeApp(App):
         yield Static(render_banner(__version__, os.getcwd()), id="banner")
         yield Static("● 对话服务已就绪", id="ready")
         yield ConversationLog(id="conversation", wrap=True, highlight=False, markup=False)
+        yield Static("", id="tool-activity", markup=False)
         yield Static("", id="streaming", markup=False)
         yield Static("", id="timer", markup=False)
         yield CommandCompletion(id="command-completion")
@@ -744,6 +826,7 @@ class DragonCodeApp(App):
         self.task_usage = TokenUsage(0, 0)
         self.task_usage_committed = False
         self.session_state = SessionState.STREAMING
+        self._clear_tool_activity()
         self.query_one("#streaming", Static).update("")
         self._update_timer()
         self.timer = self.set_interval(0.1, self._update_timer)
@@ -800,10 +883,9 @@ class DragonCodeApp(App):
                 self.query_one("#streaming", Static).update(self.reply_buffer)
             elif event.type == "tool_start" and event.tool_call is not None:
                 self._flush_streaming_text()
-                line = Text(format_tool_call(event.tool_call), style="bold cyan")
-                self.query_one("#conversation", RichLog).write(line)
+                self._start_tool_display(f"main:{event.tool_call.id}", event.tool_call)
             elif event.type == "tool_end" and event.tool_result is not None:
-                self._write_tool_result(event.tool_result)
+                self._finish_tool_display(f"main:{event.tool_result.call_id}", event.tool_result)
             elif event.type == "permission_request" and event.permission_request is not None:
                 self._show_permission_request(event.permission_request)
             elif event.type in {"permission_warning", "context_warning", "session_warning"}:
@@ -888,65 +970,71 @@ class DragonCodeApp(App):
             return
         if event.attached and event.type == "tool_start" and event.tool_call is not None:
             self._flush_subagent_buffer(event.task_id, label)
-            conversation.write(
-                Text(f"[{label}] {format_tool_call(event.tool_call)}", style="bold magenta")
+            self._start_tool_display(
+                f"sub:{event.task_id}:{event.tool_call.id}",
+                event.tool_call,
+                agent_label=label,
             )
             return
         if event.attached and event.type == "tool_end" and event.tool_result is not None:
-            result = format_tool_result(event.tool_result)
-            style = "green" if event.tool_result.success else "bold red"
-            conversation.write(Text(f"[{label}]   └─ {result}", style=style))
+            self._finish_tool_display(
+                f"sub:{event.task_id}:{event.tool_result.call_id}",
+                event.tool_result,
+                agent_label=label,
+            )
             return
         if event.attached and event.type == "progress":
             conversation.write(
                 Text(
-                    f"● Agent {label}：第 {event.iteration}/{event.max_iterations} 轮",
-                    style="dim magenta",
+                    f"● Agent  {label}  第 {event.iteration}/{event.max_iterations} 轮",
+                    style=TOOL_MUTED,
                 )
             )
             return
         if event.type == "queued":
-            conversation.write(Text(f"● Agent {label} 已排队（{event.task_id}）", style="yellow"))
+            conversation.write(Text(f"● Agent  {label}  已排队", style=TOOL_MUTED))
         elif event.type == "workspace_warning":
-            conversation.write(Text(f"● Agent {label}：{event.text}", style="bold yellow"))
+            conversation.write(Text(f"● Agent  {label}  {event.text}", style=TOOL_ERROR))
         elif event.type == "running":
             mode = "前台" if event.attached else "后台"
-            conversation.write(
-                Text(f"● Agent {label} 开始{mode}运行（{event.task_id}）", style="magenta")
-            )
+            conversation.write(Text(f"● Agent  {label}  {mode}运行", style=TOOL_ACCENT))
         elif event.type in {"manual_background", "timeout_background"}:
             reason = "用户切换" if event.type == "manual_background" else "运行超过 120 秒"
-            conversation.write(
-                Text(f"● Agent {label} 已转后台：{reason}（{event.task_id}）", style="yellow")
-            )
+            self._clear_tool_activity(prefix=f"sub:{event.task_id}:")
+            conversation.write(Text(f"● Agent  {label}  已转后台 · {reason}", style=TOOL_MUTED))
         elif event.type in {"completed", "failed", "cancelled"} and event.status in {
             TaskStatus.COMPLETED,
             TaskStatus.FAILED,
             TaskStatus.CANCELLED,
         }:
             self._flush_subagent_buffer(event.task_id, label)
-            styles = {
-                TaskStatus.COMPLETED: "bold green",
-                TaskStatus.FAILED: "bold red",
-                TaskStatus.CANCELLED: "bold yellow",
-            }
+            self._clear_tool_activity(prefix=f"sub:{event.task_id}:")
             summary = event.text.replace("\n", " ")
-            if len(summary) > 240:
-                summary = summary[:237] + "..."
-            suffix = f"：{summary}" if summary else ""
-            conversation.write(
-                Text(
-                    f"● Agent {label} {event.status.value}（{event.task_id}）{suffix}",
-                    style=styles[event.status],
+            # 中文字符通常占两个终端单元；40 字约等于 80 个显示宽度。
+            if len(summary) > 40:
+                summary = summary[:37] + "..."
+            suffix = f" · {summary}" if summary else ""
+            if event.status is TaskStatus.COMPLETED:
+                conversation.write(Text(f"✓ Agent  {label}  已完成{suffix}", style=TOOL_MUTED))
+            elif event.status is TaskStatus.CANCELLED:
+                conversation.write(Text(f"● Agent  {label}  已取消", style=TOOL_MUTED))
+            else:
+                conversation.write(
+                    Group(
+                        Text(f"✗ Agent  {label}  执行失败", style=TOOL_ERROR),
+                        Text(
+                            f"  └ {summary or '子 Agent 未正常完成'} · {event.task_id}",
+                            style=TOOL_ERROR,
+                        ),
+                    )
                 )
-            )
 
     def _flush_subagent_buffer(self, task_id: str, label: str) -> None:
         text = self.subagent_buffers.pop(task_id, "")
         if not text:
             return
         self.query_one("#conversation", RichLog).write(
-            Group(Text(f"[{label}]", style="bold magenta"), Markdown(text))
+            Group(Text(f"[{label}]", style=TOOL_ACCENT), Markdown(text))
         )
         self.query_one("#streaming", Static).update("")
 
@@ -1021,23 +1109,104 @@ class DragonCodeApp(App):
             style = "bold yellow"
         self.query_one("#conversation", RichLog).write(Text(text, style=style))
 
-    def _write_tool_result(self, result: ToolResult) -> None:
-        """按结果类型显示成功、错误、取消或状态未知。"""
+    @staticmethod
+    def _render_tool_line(
+        pending: PendingToolDisplay,
+        symbol: str,
+        *,
+        summary: str = "",
+        style: str = TOOL_MUTED,
+        active: bool = False,
+    ) -> Text:
+        """分段渲染一条工具记录，让参数始终保持低调。"""
 
+        line = Text(f"{symbol} ", style=style)
+        if pending.agent_label:
+            line.append(f"{pending.agent_label} · ", style=TOOL_MUTED)
+        line.append(pending.call.name, style=TOOL_ACCENT if active else style)
+        key = _tool_key_argument(pending.call)
+        if key:
+            line.append(f"  {key}", style=TOOL_MUTED if active else style)
+        if summary:
+            line.append(f"  {summary}", style=style)
+        return line
+
+    def _start_tool_display(
+        self,
+        key: str,
+        call: ToolCall,
+        *,
+        agent_label: str = "",
+    ) -> None:
+        """工具开始时只更新动态区，不提前污染 scrollback。"""
+
+        self.active_tool_displays[key] = PendingToolDisplay(key, call, agent_label)
+        self._update_tool_activity()
+
+    def _finish_tool_display(
+        self,
+        key: str,
+        result: ToolResult,
+        *,
+        agent_label: str = "",
+    ) -> None:
+        """工具结束后移除动态项，并把最终状态定型到历史区。"""
+
+        pending = self.active_tool_displays.pop(key, None)
+        if pending is None:
+            pending = PendingToolDisplay(
+                key,
+                ToolCall(result.call_id, result.tool_name, {}),
+                agent_label,
+            )
+        self._update_tool_activity()
+        conversation = self.query_one("#conversation", RichLog)
+        summary = format_tool_result(result)
         if result.success:
-            style = "green"
-            prefix = "  └─ "
-        elif result.error_code == "cancelled":
-            style = "bold yellow"
-            prefix = "  └─ 已取消："
-        elif result.error_code == "cancel_outcome_unknown":
-            style = "bold yellow"
-            prefix = "  └─ 状态未知："
+            conversation.write(self._render_tool_line(pending, "✓", summary=summary))
+            return
+        if result.error_code == "cancelled":
+            conversation.write(self._render_tool_line(pending, "●", summary=f"已取消 · {summary}"))
+            return
+        conversation.write(
+            Group(
+                self._render_tool_line(pending, "✗", style=TOOL_ERROR),
+                Text(f"  └ {summary}", style=TOOL_ERROR),
+            )
+        )
+
+    def _update_tool_activity(self) -> None:
+        """按发起顺序刷新全部正在运行的工具。"""
+
+        try:
+            widget = self.query_one("#tool-activity", Static)
+        except Exception:
+            # CLI finally 或未挂载的测试对象也会调用清理。
+            return
+        if not self.active_tool_displays:
+            widget.update("")
+            return
+        lines = [
+            self._render_tool_line(pending, "●", style=TOOL_ACCENT, active=True)
+            for pending in self.active_tool_displays.values()
+        ]
+        widget.update(Group(*lines))
+
+    def _clear_tool_activity(self, *, prefix: str = "") -> None:
+        """清理指定任务或整个回合遗留的动态工具。"""
+
+        if prefix:
+            keys = [key for key in self.active_tool_displays if key.startswith(prefix)]
+            for key in keys:
+                self.active_tool_displays.pop(key, None)
         else:
-            style = "bold red"
-            prefix = "  └─ 错误："
-        line = Text(prefix + format_tool_result(result), style=style)
-        self.query_one("#conversation", RichLog).write(line)
+            self.active_tool_displays.clear()
+        self._update_tool_activity()
+
+    def _write_tool_result(self, result: ToolResult) -> None:
+        """兼容直接写入结果的调用方和既有测试。"""
+
+        self._finish_tool_display(f"main:{result.call_id}", result)
 
     def _flush_streaming_text(self) -> None:
         """把工具调用前的模型文字固定到历史区。"""
@@ -1073,6 +1242,7 @@ class DragonCodeApp(App):
 
         self.stream_worker = None
         self.session_state = SessionState.IDLE
+        self._clear_tool_activity()
         self.query_one("#streaming", Static).update("")
         self.query_one("#timer", Static).update("")
 
@@ -1604,6 +1774,7 @@ class DragonCodeApp(App):
         if self.subagent_host is not None:
             await self.subagent_host.reset_sessions()
         self.subagent_buffers.clear()
+        self._clear_tool_activity()
         self._update_task_status()
 
     async def close_subagents(self) -> None:
@@ -1614,6 +1785,7 @@ class DragonCodeApp(App):
         if self.subagent_host is not None:
             await self.subagent_host.close()
         self.subagent_buffers.clear()
+        self._clear_tool_activity()
 
     def action_copy_or_quit(self) -> None:
         """有选中文字时复制，否则沿用 Ctrl+C 安全退出。"""
