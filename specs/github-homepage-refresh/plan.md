@@ -16,6 +16,8 @@
 
 **职责：** 把 ch02–ch13 的长列表压缩为四组能力卡片：自主执行、上下文、扩展、安全与协作。
 
+**修订：** 使用 GitHub 支持的 HTML table，能力域列设置 `width="27%"`，说明列设置 `width="73%"`。不增加 CSS 或图片依赖。
+
 ### 系统架构
 
 **职责：** 使用 Mermaid `flowchart` 表达 TUI、Command、Agent、LLMClient、工具调度、权限、MCP、Skill、Hook、记忆和 SubAgent 的关系。

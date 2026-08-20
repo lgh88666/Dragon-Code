@@ -31,14 +31,40 @@
 
 ## ✨ 核心能力
 
-| 能力域 | Dragon Code 能做什么 |
-|---|---|
-| **⚡ 自主执行** | 通过 ReAct Agent Loop 连续思考、调用工具、读取结果并调整策略，直到任务完成。内置 Read、Write、Edit、Bash、Glob、Grep 六个核心工具。 |
-| **🧠 上下文与记忆** | 支持流式多轮对话、大结果落盘重读、自动/手动上下文压缩、JSONL 会话恢复、项目指令和分层长期记忆。 |
-| **🛡️ 安全与控制** | 使用危险命令黑名单、项目路径沙箱、三级权限规则、四种权限模式和人在回路确认保护本地环境。 |
-| **🧩 开放扩展** | 支持 stdio/Streamable HTTP MCP、模块化 Skill、生命周期 Hook，以及定义式和 Fork 式 SubAgent。 |
-| **🎛️ 终端体验** | Textual TUI、Markdown 定型、Slash Command 补全、低饱和工具状态、Token/缓存统计和任务进度展示。 |
-| **🔀 多协议模型** | 通过统一 `LLMClient` 适配 Anthropic、OpenAI 及兼容端点，上层 Agent 行为保持一致。 |
+<table>
+  <thead>
+    <tr>
+      <th width="27%">能力域</th>
+      <th width="73%">Dragon Code 能做什么</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td width="27%"><strong>⚡ 自主执行与工具调用</strong></td>
+      <td width="73%">ReAct Agent Loop 持续调用 Read、Write、Edit、Bash、Glob、Grep，依据结果调整策略，直到任务完成。</td>
+    </tr>
+    <tr>
+      <td width="27%"><strong>🧠 上下文与持久记忆</strong></td>
+      <td width="73%">支持大结果落盘重读、上下文压缩、JSONL 会话恢复、项目指令和分层长期记忆。</td>
+    </tr>
+    <tr>
+      <td width="27%"><strong>🛡️ 权限与安全边界</strong></td>
+      <td width="73%">黑名单、路径沙箱、三级规则、四种权限模式和人在回路共同保护本地环境。</td>
+    </tr>
+    <tr>
+      <td width="27%"><strong>🧩 MCP、Skill 与 Hook</strong></td>
+      <td width="73%">支持 stdio/Streamable HTTP MCP、模块化 Skill 和完整生命周期 Hook。</td>
+    </tr>
+    <tr>
+      <td width="27%"><strong>🎛️ 终端交互与反馈</strong></td>
+      <td width="73%">Textual TUI、Markdown 定型、Slash Command 补全、低饱和工具状态和 Token 统计。</td>
+    </tr>
+    <tr>
+      <td width="27%"><strong>🔀 模型与任务协作</strong></td>
+      <td width="73%">统一 LLMClient 适配多种协议，定义式与 Fork 式 SubAgent 负责隔离复杂任务。</td>
+    </tr>
+  </tbody>
+</table>
 
 <a id="architecture"></a>
 

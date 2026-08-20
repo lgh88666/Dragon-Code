@@ -13,6 +13,13 @@ README 已按“专业、克制、有趣”的方向完成重构。本地内容�
 - 常用命令表由当前 CommandRegistry 与内置 Skill 反查生成。
 - 源码导航、章节进度、验证方式和当前边界均已补齐，ch14 明确为学习与规划中。
 
+### 能力矩阵视觉修订
+
+- 根据用户反馈，将 GitHub 自动分栏的 Markdown 表格改为 HTML table。
+- “能力域”列固定为 27%，说明列固定为 73%，六项能力名称更完整。
+- 右栏描述进一步压缩，降低文字墙感；没有增加 CSS 或外部图片依赖。
+- HTML table、thead、tbody、tr、th、td 标签数量成对，宽度合计 100%。
+
 ## 本地证据
 
 ```text
@@ -24,6 +31,8 @@ Personal absolute path hits        0
 uv run ruff format --check .       234 files already formatted
 uv run ruff check .                All checks passed
 uv run pytest -q                    530 passed, 2 skipped
+HTML table width                    27% / 73%
+HTML tag pairs                      PASS
 ```
 
 ## 远端证据
