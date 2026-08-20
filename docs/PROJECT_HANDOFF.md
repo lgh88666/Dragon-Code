@@ -16,10 +16,10 @@
 ## 当前状态
 
 - 已完成：ch02–ch13。
-- 最近完成模块：ch13 后的工具与 SubAgent 交互可读性优化。
+- 最近完成模块：GitHub 项目主页 README 专业化重构。
 - ch07 实现提交：`9b0d901 feat: add MCP client integration`。
 - ch08 实现提交：`97d3cd7 feat: add ch08 context management`。
-- ch02–ch12 已推送到 GitHub `master`；ch13 与后续交互优化保留本地提交，等待用户明确要求再推送。
+- ch02–ch13 与工具交互优化已推送到 GitHub `master`；主页美化完成验证后按用户授权继续推送。
 - 下一开发章节开始前，继续执行理论学习与四文档审批硬门槛。
 
 ## 已有能力
@@ -147,6 +147,15 @@
 - 自动化证据：`53` 项 TUI 测试通过，全量 `530 passed, 2 skipped`，Ruff 通过。
 - tmux 证据：真实 Read/Grep/Bash、前台定义式子 Agent、后台 Fork、失败恢复与退出清理通过。
 - 完整证据见 `specs/tool-readability/acceptance-report.md`。
+
+### 项目主页：README 专业化重构
+
+- 使用 Dragon Banner、克制表情和真实技术徽章建立清晰首屏。
+- 把 ch02–ch13 能力按工程领域重新分组，并增加 Mermaid 核心架构图。
+- 增加快速开始、完整命令表、折叠配置说明、源码导航、开发进度和当前边界。
+- 明确 ch14 Git Worktree 尚在学习与规划中，不把未来能力标记为已完成。
+- 本地证据：Markdown/链接/敏感信息检查通过，Ruff 通过，全量 `530 passed, 2 skipped`。
+- 完整证据见 `specs/github-homepage-refresh/acceptance-report.md`。
 
 ## 当前核心调用链
 
