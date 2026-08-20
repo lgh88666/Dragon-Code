@@ -1,8 +1,8 @@
 # Dragon Code GitHub 项目主页美化验收报告
 
-## 当前结论
+## 结论
 
-README 已按“专业、克制、有趣”的方向完成重构。本地内容、Markdown、链接、敏感信息与全量回归均通过；远端 GitHub 验证将在首次主页提交推送后补记。
+README 已按“专业、克制、有趣”的方向完成重构。本地内容、Markdown、链接、敏感信息、全量回归和远端 GitHub 验证均通过。
 
 ## 页面结果
 
@@ -28,4 +28,12 @@ uv run pytest -q                    530 passed, 2 skipped
 
 ## 远端证据
 
-首次主页提交推送后补充 GitHub `master` SHA 与远端 README 内容检查。
+```text
+Homepage commit                    c66a47a729c257a3d648169e863485e8e3335799
+git push origin master             PASS（HTTP/1.1）
+git ls-remote origin master        与主页提交一致
+GitHub project page                HTTP 200
+Remote README source               包含标题、徽章、Mermaid、快速开始和 ch14 边界
+```
+
+首次普通推送遇到两次 `Recv failure: Connection was reset`；GitHub 443 与网页访问正常，改为仅本次命令使用 `git -c http.version=HTTP/1.1 push origin master` 后成功，没有修改提交历史。

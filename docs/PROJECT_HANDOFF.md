@@ -19,7 +19,7 @@
 - 最近完成模块：GitHub 项目主页 README 专业化重构。
 - ch07 实现提交：`9b0d901 feat: add MCP client integration`。
 - ch08 实现提交：`97d3cd7 feat: add ch08 context management`。
-- ch02–ch13 与工具交互优化已推送到 GitHub `master`；主页美化完成验证后按用户授权继续推送。
+- ch02–ch13、工具交互优化和主页美化均已推送到 GitHub `master`；主页提交为 `c66a47a`。
 - 下一开发章节开始前，继续执行理论学习与四文档审批硬门槛。
 
 ## 已有能力

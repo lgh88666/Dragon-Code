@@ -26,6 +26,6 @@
 
 ## GitHub 端到端
 
-- [ ] 只提交 README 和本功能 Spec/交接文件，没有提交 `.idea/`、`321.txt` 或本地 Skill。（验证：暂存清单）
-- [ ] 新提交已推送到 `origin/master`。（验证：远端分支 SHA）
-- [ ] GitHub 项目主页读取到新标题、徽章、架构与快速开始内容。（验证：打开远端 README）
+- [x] 只提交 README 和本功能 Spec/交接文件，没有提交 `.idea/`、`321.txt` 或本地 Skill。（验证：提交清单）
+- [x] 主页提交 `c66a47a` 已推送到 `origin/master`。（验证：`git ls-remote`）
+- [x] GitHub 项目主页已包含新标题、徽章、架构与快速开始内容。（验证：远端提交内容 + GitHub 页面 HTTP 200）
